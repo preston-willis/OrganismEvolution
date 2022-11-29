@@ -2,6 +2,7 @@ import pygame
 import numpy as np
 import uuid
 pygame.init()
+import time
 
 white = (255,255,255)
 black = (0,0,0)
@@ -13,8 +14,8 @@ blue = (0,0,255)
 gameDisplay = pygame.display.set_mode((800,800))
 gameDisplay.fill(black)
 
-ENERGY_DECAY = 0.00005
-CELL_LIMIT = 500
+ENERGY_DECAY = 0.1
+CELL_LIMIT = 800
 ORIGIN = [400, 0]
 
 ENERGY_CONSERVED = 0.5
@@ -52,18 +53,21 @@ class Organism:
         self.cells = [Cell(origin[0], origin[1], uuid.uuid1())]
         self.occupied = [origin]
         self.energyConserved = ENERGY_CONSERVED
+        self.previous_energy_matrix = []
 
-    def tick(self, food_energy):
-        ind = len(self.cells)-1
-        food_from_cell = food_energy
+    def tick(self, ticks):
+        ind = 0
+        if ticks < 800:
+            food_energy = [1]*len(self.cells)
+        else:
+            food_energy = [0.04]*len(self.cells)
+            for i in range(10):
+                food_energy[(ticks+(100*i))%799] = 1
+
+        energies = self.compute_energies(food_energy, ticks)
         newCells = []
-        for cell in reversed(self.cells):
-            if ind < len(self.cells)-1:
-                food_from_cell = self.cells[ind + 1].energy*(1-self.energyConserved)
-                self.cells[ind + 1].energy *= self.energyConserved
-
-            newCell = cell.tick(food_from_cell)
-
+        for cell in self.cells:
+            newCell = cell.tick(energies[ind])
             if not cell.dead:
                 if newCell is not None:
                     if [newCell.x, newCell.y] not in self.occupied and len(self.cells) < CELL_LIMIT:
@@ -75,8 +79,41 @@ class Organism:
                 del self.cells[ind]
                 self.occupied.remove([cell.x, cell.y])
                 self.cells[ind-1].ableToReplicate = 1
-            ind -= 1
+            ind += 1
         [self.cells.append(i) for i in newCells]
+
+    def compute_energies(self, energy_matrix, ticks):
+        ENERGY_UP = 0.45
+        ENERGY_DOWN = 0.45
+        if ticks == 0:
+            self.previous_energy_matrix = [energy_matrix[0]]*3
+            return self.previous_energy_matrix
+
+        elif ticks > 0:
+            new_energy_matrix = [0]*len(self.cells)
+            if len(self.cells) > 3:
+                for cell_index in range(len(self.cells)):
+                    if cell_index < len(self.previous_energy_matrix)-1:
+                        energy_down = self.previous_energy_matrix[cell_index+1]
+                        energy_up = self.previous_energy_matrix[cell_index-1]
+                    else:
+                        energy_down = 0
+                        energy_up = 0
+                    if cell_index == 0:
+                        new_energy_matrix[cell_index] = energy_down * ENERGY_DOWN
+                    if cell_index == len(self.cells)-1:
+                        new_energy_matrix[cell_index] = energy_up * ENERGY_UP
+                    else:
+                        new_energy_matrix[cell_index] = (energy_up * ENERGY_UP) + (energy_down * ENERGY_DOWN)
+                total_energy = np.add(new_energy_matrix, energy_matrix)
+                for e in range(len(total_energy)):
+                    if total_energy[e] > 1: total_energy[e] = 1
+                    if total_energy[e] < 0: total_energy[e] = 0
+
+                self.previous_energy_matrix = total_energy
+            else: return energy_matrix
+            return self.previous_energy_matrix
+
 
 class Cell:
     def __init__(self, x, y, id) -> None:
@@ -89,13 +126,10 @@ class Cell:
         self.adjacents = []
 
     def tick(self, food_energy):
-        self.energy += food_energy
+        self.energy = food_energy
         self.energy -= ENERGY_DECAY
         newCell = None
-        if self.energy > 1:
-            self.energy = 1
         if self.energy < 0:
-            self.energy = 0
             self.die()
         else:
             newCell = self.replicate()
@@ -121,13 +155,15 @@ class Cell:
             return Cell(self.x+xdir, self.y+ydir, uuid.uuid1())
         return None
 
-organism = Organism(ORIGIN)
+organisms = []
+for i in range(10):
+    organisms.append(Organism([i*80,0]))
 ticks = 0
 energy_by_tick = 1
 while True:
-    organism.tick(energy_by_tick)
-    render_cells(organism)
-    print(energy_by_tick)
+    for i in range(10):
+        organisms[i].tick(ticks)
+        render_cells(organisms[i])
     energy_by_tick += handle_pygame()
     pygame.display.update()
 
