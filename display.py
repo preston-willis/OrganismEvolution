@@ -1,8 +1,9 @@
 import pygame
 import numpy as np
 import uuid
+import collections
+
 pygame.init()
-import time
 
 white = (255,255,255)
 black = (0,0,0)
@@ -23,11 +24,13 @@ ENERGY_CONSERVED = 0.5
 pixAr = pygame.PixelArray(gameDisplay)
 
 def render_cells(org):
-    for cell in org.cells:
-        if cell.x < len(pixAr) and cell.y < len(pixAr[0]) and cell.dead == False:
-            pixAr[cell.x][cell.y] = (0, int(cell.energy*255), 0)
-        elif cell.dead:
-            pixAr[cell.x][cell.y] = black
+    for idx in list(org.positions):
+        for idy in list(org.positions[idx]):
+            cell = org.positions[idx][idy]
+            if cell.x < len(pixAr) and cell.y < len(pixAr[0]) and cell.dead == False:
+                pixAr[cell.x][cell.y] = (0, int(cell.energy*255), 0)
+            elif cell.dead:
+                pixAr[cell.x][cell.y] = black
 
 def handle_pygame():
     energy_mod = 0
@@ -50,37 +53,38 @@ def handle_pygame():
 class Organism:
     def __init__(self, origin) -> None:
         self.origin = origin
-        self.cells = [Cell(origin[0], origin[1], uuid.uuid1())]
-        self.occupied = [origin]
+        self.originCell = Cell(origin[0], origin[1], uuid.uuid1())
+        self.positions = collections.defaultdict(dict)
+        self.members = 0
+        self.positions[self.originCell.x][self.originCell.y] = self.originCell
         self.energyConserved = ENERGY_CONSERVED
         self.previous_energy_matrix = []
 
     def tick(self, ticks):
-        ind = 0
         if ticks < 800:
-            food_energy = [1]*len(self.cells)
+            food_energy = [1]*self.members
         else:
-            food_energy = [0.04]*len(self.cells)
+            food_energy = [0.04]*self.members
             for i in range(10):
                 food_energy[(ticks+(100*i))%799] = 1
 
-        energies = self.compute_energies(food_energy, ticks)
-        newCells = []
-        for cell in self.cells:
-            newCell = cell.tick(energies[ind])
-            if not cell.dead:
-                if newCell is not None:
-                    if [newCell.x, newCell.y] not in self.occupied and len(self.cells) < CELL_LIMIT:
-                        newCells.append(newCell)
-                        self.occupied.append([newCell.x, newCell.y])
-                        cell.ableToReplicate -= 1
-                        cell.adjacents.append(newCell)
-            if cell.dead: 
-                del self.cells[ind]
-                self.occupied.remove([cell.x, cell.y])
-                self.cells[ind-1].ableToReplicate = 1
-            ind += 1
-        [self.cells.append(i) for i in newCells]
+        energies = collections.defaultdict(dict)#self.compute_energies(food_energy, ticks)
+        updated_positions = self.positions
+        for idx in list(self.positions):
+            for idy in list(self.positions[idx]):
+                cell = self.positions[idx][idy]
+                energies[cell.x][cell.y] = 0
+                newCell = cell.tick(energies[cell.x][cell.y])
+                if not cell.dead:
+                    if newCell is not None:
+                        if self.members < CELL_LIMIT:
+                            self.members += 1
+                            updated_positions[newCell.x][newCell.y] = newCell
+                            cell.ableToReplicate -= 1
+                if cell.dead: 
+                    self.members -= 1
+                    updated_positions[cell.x].pop(cell.y)
+        self.positions = updated_positions
 
     def compute_energies(self, energy_matrix, ticks):
         ENERGY_UP = 0.45
@@ -90,9 +94,9 @@ class Organism:
             return self.previous_energy_matrix
 
         elif ticks > 0:
-            new_energy_matrix = [0]*len(self.cells)
+            new_energy_matrix = [0]*self.members
             if len(self.cells) > 3:
-                for cell_index in range(len(self.cells)):
+                for cell_index in range(self.members):
                     if cell_index < len(self.previous_energy_matrix)-1:
                         energy_down = self.previous_energy_matrix[cell_index+1]
                         energy_up = self.previous_energy_matrix[cell_index-1]
@@ -123,7 +127,6 @@ class Cell:
         self.energy = 0
         self.dead = False
         self.ableToReplicate = 1
-        self.adjacents = []
 
     def tick(self, food_energy):
         self.energy = food_energy
