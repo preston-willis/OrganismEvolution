@@ -1,2 +1,5 @@
-import numpy as np
-import matplotlib.pyplot as plt
+from EvolutionDriver import EvolutionDriver
+
+if __name__ == '__main__':
+    e = EvolutionDriver()
+    e.run()
