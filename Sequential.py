@@ -13,8 +13,8 @@ class Sequential:
         self.network = []
 
         for i in range(self.layerNumber):
-            layer = np.subtract(np.dot(np.random.random_sample((self.nodesByLayer[i], self.nodesByLayer[i+1])), 2), 1)
-            #layer = np.zeros((self.nodesByLayer[i], self.nodesByLayer[i+1]))
+            #layer = np.subtract(np.dot(np.random.random_sample((self.nodesByLayer[i], self.nodesByLayer[i+1])), 2), 1)
+            layer = np.zeros((self.nodesByLayer[i], self.nodesByLayer[i+1]))
             self.network.append(layer)
 
     def linear(self, x, layerIndex):
@@ -28,4 +28,4 @@ class Sequential:
         for layer in range(len(self.network)):
             x = self.linear(x, layer) # Compute one layer of the net
         x = np.exp(x)/np.sum(np.exp(x)) # softmax
-        return x
+        return [0.25,0.25,0.25,0.25]

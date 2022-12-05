@@ -23,6 +23,7 @@ class Renderer:
         self.pixAr[energy_pos[0][0]][energy_pos[0][1]] = (255,0,0)
         self.pixAr[energy_pos[1][0]][energy_pos[1][1]] = (255,0,0)
 
+
     def reset(self):
         self.gameDisplay.fill((0,0,0))
 

@@ -7,7 +7,7 @@ class GeneticAlgorithm:
         self.fittestIndex = 0
         self.popSize = popSize
         self.subjects = [Sequential() for _ in range(popSize)]
-        self.load("working-organism-le-2.csv")
+        self.load("organism-open-transmission-multiple-energy-sources.csv")
         self.mut_rate = mut_rate
         self.bots_mutated = bots_mut
         self.mutation_magnitude = mut_mag
@@ -57,13 +57,13 @@ class GeneticAlgorithm:
 
                     # Create random samples
                     random_mask = np.random.random_sample((self.subjects[i].nodesByLayer[layerIndex], self.subjects[i].nodesByLayer[layerIndex+1]))
-                    random_values = np.subtract(np.dot(np.random.random_sample((self.subjects[i].nodesByLayer[layerIndex], self.subjects[i].nodesByLayer[layerIndex+1])), 2), 1)
+                    random_values = np.subtract(np.dot(np.random.random_sample((self.subjects[i].nodesByLayer[layerIndex], self.subjects[i].nodesByLayer[layerIndex+1])), 0.5), 1)
 
                     # Create mask of random indexes
                     m = np.ma.masked_where(mut_rate > random_mask, self.subjects[i].network[layerIndex])
 
                     # Assign random values to the masked indexes
-                    original[np.where(m.mask)] = random_values[np.where(m.mask)]
+                    original[np.where(m.mask)] += random_values[np.where(m.mask)]
 
                     # Set new net to the old copy
                     self.subjects[i].network[layerIndex] = original.copy()
