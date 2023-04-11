@@ -1,5 +1,7 @@
-import pygame
+import os
+os.environ['PYGAME_HIDE_SUPPORT_PROMPT'] = "hide"
 
+import pygame
 
 class Renderer:
     def __init__(self) -> None:
@@ -12,16 +14,18 @@ class Renderer:
     def render_cells(self, org, energy_pos):
         for idx in list(org.positions):
             for idy in list(org.positions[idx]):
-                cell = org.positions[idx][idy]
-                if cell.x < len(self.pixAr) and cell.y < len(self.pixAr[0]) and cell.dead == False:
-                    color = int(cell.energy*255)
-                    if color > 255: color = 255
-                    if color < 0: color = 0
-                    self.pixAr[cell.x][cell.y] = (0, color, 0)
-                elif cell.dead:
-                    self.pixAr[cell.x][cell.y] = (0,0,0)
-        self.pixAr[energy_pos[0][0]][energy_pos[0][1]] = (255,0,0)
-        self.pixAr[energy_pos[1][0]][energy_pos[1][1]] = (255,0,0)
+                if (idx in org.positions.keys()):
+                    if (idy in org.positions[idx]):
+                        cell = org.positions[idx][idy]
+                        if cell.x < len(self.pixAr) and cell.y < len(self.pixAr[0]) and cell.dead == False:
+                            color = int(cell.energy*255)
+                            if color > 255: color = 255
+                            if color < 0: color = 0
+                            self.pixAr[cell.x][cell.y] = (0, color, 0)
+                        elif cell.dead:
+                            self.pixAr[cell.x][cell.y] = (0,0,0)
+        for e in energy_pos:
+            self.pixAr[e.x][e.y] = (int(255*e.energy),0,0)
 
     def reset(self):
         self.gameDisplay.fill((0,0,0))

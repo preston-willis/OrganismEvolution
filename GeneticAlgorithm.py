@@ -1,13 +1,24 @@
 from Sequential import Sequential
 import math
 import numpy as np
+import time
+import uuid
+
+run_id = str(uuid.uuid1())[:4]
+
 
 class GeneticAlgorithm:
-    def __init__(self, popSize, mut_rate, mut_mag, bots_mut):
+    def __init__(self, popSize, mut_rate, mut_mag, bots_mut, model_file = ""):
         self.fittestIndex = 0
         self.popSize = popSize
         self.subjects = [Sequential() for _ in range(popSize)]
-        self.load("working-organism-le-2.csv")
+        try:
+            self.load(model_file)
+            print("Loaded "+model_file)
+        except:
+            print("Couldn't load "+model_file)
+        time.sleep(1)
+
         self.mut_rate = mut_rate
         self.bots_mutated = bots_mut
         self.mutation_magnitude = mut_mag
@@ -18,6 +29,12 @@ class GeneticAlgorithm:
 
     def compute_generation(self):
         self.calc_fittest()
+
+        # SAVE TRAINED
+        if self.subjects[self.fittestIndex].fitness > 0:
+            file = open('data/'+run_id+'_'+str(self.subjects[self.fittestIndex].fitness)+'.csv', "w")
+            file.write(str(self.subjects[self.fittestIndex].network))
+            file.close()
         self.crossover(self.subjects[self.fittestIndex])
         self.mutate(self.mut_rate)
 
@@ -40,7 +57,6 @@ class GeneticAlgorithm:
                 data += "]"
             layer = np.array(eval(data))
             network.append(layer)
-        print(network)
         self.subjects[0].network = network
 
     def crossover(self, parent1):
