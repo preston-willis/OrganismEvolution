@@ -35,13 +35,13 @@ class Environment:
         for i in range(self.world_size):
             for j in range(self.world_size):
                 # Higher frequency noise with more octaves
-                perlin_values[i, j] = pnoise2(i * self.noise_scale * 3, j * self.noise_scale * 3, octaves=6)
+                perlin_values[i, j] = pnoise2(i * self.noise_scale * NOISE_FREQUENCY_MULTIPLIER, j * self.noise_scale * NOISE_FREQUENCY_MULTIPLIER, octaves=NOISE_OCTAVES)
         
         # Normalize to 0-1
         perlin_values = (perlin_values - perlin_values.min()) / (perlin_values.max() - perlin_values.min())
         
         # Apply power function to create more low energy zones
-        perlin_values = np.power(perlin_values, 2.5)
+        perlin_values = np.power(perlin_values, NOISE_POWER)
         
         # Quantize
         terrain = np.round(perlin_values / self.quantization_step) * self.quantization_step
@@ -49,6 +49,11 @@ class Environment:
         
         # Convert to tensor
         return torch.tensor(terrain, dtype=torch.float16, device=device)
+    
+    def compute_environment(self, topology_matrix):
+        """Modify environment based on organism presence"""
+        # Set environment to 0 where organisms exist
+        self.terrain = torch.where(topology_matrix > 0, torch.tensor(0.0, device=device), self.terrain)
 
 class OrganismManager:
     def __init__(self, world_size, organism_count, terrain):
@@ -70,7 +75,7 @@ class OrganismManager:
             y_coords, x_coords = self.positions[:, 1], self.positions[:, 0]
             self.topology_matrix[y_coords, x_coords] = 1
     
-    def compute_topology(self, probability):
+    def compute_topology(self):
         """Add random adjacent cells to topology using efficient convolution"""
         # Use convolution to find adjacent empty cells efficiently
         # Create a 3x3 kernel to find adjacent positions
@@ -98,16 +103,83 @@ class OrganismManager:
         
         # Random selection using probability - apply directly to the mask
         random_values = torch.rand_like(self.topology_matrix, dtype=torch.float16)
-        selected_mask = (random_values < probability) & energy_mask
+        selected_mask = (random_values < self.reproduction_probability) & energy_mask
         
         if torch.any(selected_mask):
+            # Count how many cells are being spawned
+            num_spawned = torch.sum(selected_mask).item()
+            
+            # Reduce energy of parent cells by REPRODUCTION_THRESHOLD * spawned cells
+            # Find parent cells (organisms that are adjacent to the new cells)
+            parent_energy_reduction = REPRODUCTION_THRESHOLD * num_spawned/8
+            
+            # Create a mask for parent cells (organisms adjacent to new cells)
+            parent_kernel = torch.ones((3, 3), device=device, dtype=torch.float16)
+            parent_kernel[1, 1] = 0  # Don't include center cell
+            
+            # Find organisms adjacent to new cells
+            parent_mask = torch.nn.functional.conv2d(
+                selected_mask.unsqueeze(0).unsqueeze(0).to(torch.float16), 
+                parent_kernel.unsqueeze(0).unsqueeze(0), 
+                padding=1
+            ).squeeze() > 0
+            
+            # Reduce energy of parent cells
+            self.energy_matrix = torch.clamp(self.energy_matrix - parent_energy_reduction * parent_mask.float(), 0, 1)
+            
             # Add selected positions to topology
             self.topology_matrix[selected_mask] = 1
     
     def compute_energy(self):
-        """Deplete all energies by ENERGY_DECAY"""
+        """Deplete all energies by ENERGY_DECAY and allow energy sharing between adjacent cells"""
         # Apply energy decay only where topology = 1 (organisms)
         self.energy_matrix = torch.clamp(self.energy_matrix - ENERGY_DECAY * self.topology_matrix, 0, 1)
+        
+        # Remove organisms with energy below quantization step
+        low_energy_mask = self.energy_matrix < QUANTIZATION_STEP
+        self.topology_matrix[low_energy_mask] = 0
+        
+        
+        # Energy sharing between adjacent cells (conserving total energy)
+        sharing_rate = ENERGY_SHARING_RATE
+        
+        # Calculate how much energy each cell can share (only organisms can share)
+        shareable_energy = self.energy_matrix * self.topology_matrix * sharing_rate
+        
+        # Create a 3x3 kernel for energy distribution (excluding center)
+        kernel = torch.ones((3, 3), device=device, dtype=torch.float16)
+        kernel[1, 1] = 0  # Don't include center cell
+        
+        # Distribute energy to adjacent cells
+        distributed_energy = torch.nn.functional.conv2d(
+            shareable_energy.unsqueeze(0).unsqueeze(0).to(torch.float16), 
+            kernel.unsqueeze(0).unsqueeze(0), 
+            padding=1
+        ).squeeze()
+        
+        # Only organisms can receive energy
+        receiving_mask = self.topology_matrix > 0
+        
+        if torch.any(receiving_mask):
+            # Calculate how much energy each cell can receive (proportional to available space)
+            energy_deficit = 1.0 - self.energy_matrix
+            total_deficit = torch.nn.functional.conv2d(
+                energy_deficit.unsqueeze(0).unsqueeze(0).to(torch.float16), 
+                kernel.unsqueeze(0).unsqueeze(0), 
+                padding=1
+            ).squeeze()
+            
+            # Avoid division by zero
+            total_deficit = torch.clamp(total_deficit, min=1e-6)
+            
+            # Calculate energy to receive based on proportional deficit
+            energy_to_receive = distributed_energy * (energy_deficit / total_deficit) * receiving_mask.float()
+            
+            # Remove shared energy from source cells
+            self.energy_matrix = torch.clamp(self.energy_matrix - shareable_energy, 0, 1)
+            
+            # Add received energy to destination cells
+            self.energy_matrix = torch.clamp(self.energy_matrix + energy_to_receive, 0, 1)
             
 class Renderer:
     def __init__(self, world_size):
@@ -234,10 +306,13 @@ class Simulation:
     def update_simulation(self):
         """Update one simulation tick"""
         # DISABLE topology expansion (major CPU bottleneck)
-        self.organism_manager.compute_topology(probability=TOPOLOGY_EXPANSION_PROBABILITY)
+        self.organism_manager.compute_topology()
         
-        # Compute energy decay
+        # Compute energy decay and sharing
         self.organism_manager.compute_energy()
+        
+        # Compute environment changes
+        self.environment.compute_environment(self.organism_manager.topology_matrix)
         
         self.logger.update_fps()
        

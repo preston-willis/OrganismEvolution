@@ -1,20 +1,26 @@
 # Configuration constants for the organism simulation
 
 # World Configuration
-WORLD_SIZE = 500
+WORLD_SIZE = 1000
 ORGANISM_COUNT = 4
 
 # Environment Configuration
 NOISE_SCALE = 0.01
 QUANTIZATION_STEP = 0.01
+NOISE_FREQUENCY_MULTIPLIER = 3
+NOISE_OCTAVES = 6
+NOISE_POWER = 2.5
 
 # Organism Configuration
-ENERGY_DECAY = 0.001
-ORGANISM_POSITIONS = [(250, 250)]
+ENERGY_DECAY = 0.0005
+ORGANISM_POSITIONS = [(500, 500)]
 
 # Reproduction Configuration
-REPRODUCTION_THRESHOLD = 0.2
-REPRODUCTION_PROBABILITY = 0.01
+REPRODUCTION_THRESHOLD = 0.01
+REPRODUCTION_PROBABILITY = 1
+
+# Energy Configuration
+ENERGY_SHARING_RATE = 0
 
 # Rendering Configuration
 RENDERING_FPS = 30   # Desired rendering FPS
@@ -31,6 +37,3 @@ GPU_CACHE_CLEAR_INTERVAL = 10
 
 # Debug Configuration
 DEBUG_PRINT_INTERVAL = 10
-
-# Topology Configuration
-TOPOLOGY_EXPANSION_PROBABILITY = 0.1
