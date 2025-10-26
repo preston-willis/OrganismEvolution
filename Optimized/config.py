@@ -12,7 +12,7 @@ NOISE_OCTAVES = 6
 NOISE_POWER = 2.5
 
 # Organism Configuration
-ENERGY_DECAY = 0.0005
+ENERGY_DECAY = 0
 ORGANISM_POSITIONS = [(500, 500)]
 
 # Reproduction Configuration
@@ -20,7 +20,7 @@ REPRODUCTION_THRESHOLD = 0.01
 REPRODUCTION_PROBABILITY = 1
 
 # Energy Configuration
-ENERGY_SHARING_RATE = 0
+ENERGY_SHARING_RATE = 0.5
 
 # Rendering Configuration
 RENDERING_FPS = 30   # Desired rendering FPS

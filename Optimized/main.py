@@ -63,6 +63,7 @@ class OrganismManager:
         self.positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
         self.topology_matrix = torch.zeros((world_size, world_size), dtype=torch.float16, device=device)
         self.energy_matrix = terrain.clone()
+        self.new_cell_candidates = torch.zeros((world_size, world_size), dtype=torch.bool, device=device)
         self._initialize_topology()
         
         # Reproduction parameters
@@ -160,6 +161,9 @@ class OrganismManager:
         # Only organisms can receive energy
         receiving_mask = self.topology_matrix > 0
         
+        # Store mask of where energy is shared but topology = 0 (new cell candidates)
+        self.new_cell_candidates = (distributed_energy > 0) & (self.topology_matrix == 0)
+        
         if torch.any(receiving_mask):
             # Calculate how much energy each cell can receive (proportional to available space)
             energy_deficit = 1.0 - self.energy_matrix
@@ -194,7 +198,7 @@ class Renderer:
         self.render_mode = "org_energy" if self.render_mode == "org_top" else "org_top"
         print(f"Render mode: {self.render_mode}")
     
-    def render(self, environment, topology, mask):
+    def render(self, environment, topology, mask, new_cell_candidates=None):
         """Render the current state using PyTorch tensors directly - GPU accelerated"""
         env_scaled = environment.clamp(0, 1)
         
@@ -217,6 +221,12 @@ class Renderer:
             image[0] = topology * 0.0 + (1 - topology) * env_scaled
             image[1] = topology * mask + (1 - topology) * env_scaled
             image[2] = topology * 0.0 + (1 - topology) * env_scaled
+        
+        # Render new cell candidates as blue
+        if new_cell_candidates is not None:
+            image[0] = new_cell_candidates.float() * 0.0 + (1 - new_cell_candidates.float()) * image[0]
+            image[1] = new_cell_candidates.float() * 0.0 + (1 - new_cell_candidates.float()) * image[1]
+            image[2] = new_cell_candidates.float() * 1.0 + (1 - new_cell_candidates.float()) * image[2]
         
         return image
     
@@ -329,7 +339,8 @@ class Simulation:
         return {
             'terrain': self.environment.terrain,
             'topology': self.organism_manager.topology_matrix,
-            'energy': self.organism_manager.energy_matrix
+            'energy': self.organism_manager.energy_matrix,
+            'new_cell_candidates': self.organism_manager.new_cell_candidates
         }
     
 
@@ -430,7 +441,8 @@ def main():
             image_tensor = current_renderer.render(
                 last_sim_data['terrain'], 
                 last_sim_data['topology'], 
-                mask
+                mask,
+                last_sim_data['new_cell_candidates']
             )
             
             # Store the rendered image for display() to use
