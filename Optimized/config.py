@@ -2,7 +2,7 @@
 import random
 # World Configuration
 WORLD_SIZE = 1000
-ORGANISM_COUNT = 40
+ORGANISM_COUNT = 4
 
 # Environment Configuration
 NOISE_SCALE = 0.01
@@ -12,16 +12,16 @@ NOISE_OCTAVES = 6
 NOISE_POWER = 4
 
 # Organism Configuration
-ENERGY_HARVEST_RATE = 0.02
+ENERGY_HARVEST_RATE = 0.0005
 ENERGY_DECAY = 0.0001
 ORGANISM_POSITIONS = [(random.randint(0, WORLD_SIZE - 1), random.randint(0, WORLD_SIZE - 1)) for i in range(ORGANISM_COUNT)]
 
 # Reproduction Configuration
 REPRODUCTION_THRESHOLD = 0.001
-DEATH_THRESHOLD = 0.001
+DEATH_THRESHOLD = 0.0015
 
 # Energy Configuration
-ENERGY_SHARING_RATE = 0.1
+ENERGY_SHARING_RATE = 1
 
 
 # Rendering Configuration

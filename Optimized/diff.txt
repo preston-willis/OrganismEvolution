@@ -1,0 +1,158 @@
+diff --git a/Optimized/__pycache__/config.cpython-312.pyc b/Optimized/__pycache__/config.cpython-312.pyc
+index decff18..c6f22b4 100644
+Binary files a/Optimized/__pycache__/config.cpython-312.pyc and b/Optimized/__pycache__/config.cpython-312.pyc differ
+diff --git a/Optimized/__pycache__/input_handler.cpython-312.pyc b/Optimized/__pycache__/input_handler.cpython-312.pyc
+index 69b607f..2448e35 100644
+Binary files a/Optimized/__pycache__/input_handler.cpython-312.pyc and b/Optimized/__pycache__/input_handler.cpython-312.pyc differ
+diff --git a/Optimized/config.py b/Optimized/config.py
+index 35c13b9..a787fbf 100644
+--- a/Optimized/config.py
++++ b/Optimized/config.py
+@@ -1,15 +1,15 @@
+ # Configuration constants for the organism simulation
+ import random
+ # World Configuration
+-WORLD_SIZE = 1000
++WORLD_SIZE = 100
+ ORGANISM_COUNT = 40
+ 
+ # Environment Configuration
+ NOISE_SCALE = 0.01
+ QUANTIZATION_STEP = 0.01
+-NOISE_FREQUENCY_MULTIPLIER = 3
+-NOISE_OCTAVES = 6
+-NOISE_POWER = 4
++NOISE_FREQUENCY_MULTIPLIER = 6
++NOISE_OCTAVES = 12
++NOISE_POWER = 2
+ 
+ # Organism Configuration
+ ENERGY_HARVEST_RATE = 0.02
+diff --git a/Optimized/main.py b/Optimized/main.py
+index e53ba44..a51ac77 100644
+--- a/Optimized/main.py
++++ b/Optimized/main.py
+@@ -18,6 +18,51 @@ from gpu_handler import GPUHandler
+ from logger import Logger
+ from input_handler import InputHandler
+ 
++class EnergyDistributionCNN(torch.nn.Module):
++    """CNN that takes 3x3 energy patches and outputs 3x3 distributed energies"""
++    def __init__(self, device):
++        super().__init__()
++        self.device = device
++        
++        # Custom convolution using buffers (no gradients)
++        # Conv1: 1 input channel, 1 output channel, 3x3 kernel
++        conv1_weight = torch.ones(1, 1, 3, 3, device=device)
++        conv1_bias = torch.zeros(1, device=device)
++        self.register_buffer('conv1_weight', conv1_weight)
++        self.register_buffer('conv1_bias', conv1_bias)
++        
++        # Conv2: 1 input channel, 1 output channel, 3x3 kernel  
++        conv2_weight = torch.ones(1, 1, 3, 3, device=device)
++        conv2_bias = torch.zeros(1, device=device)
++        self.register_buffer('conv2_weight', conv2_weight)
++        self.register_buffer('conv2_bias', conv2_bias)
++        
++        # Move model to device
++        self.to(device)
++        
++        # Activation functions
++        self.relu = torch.nn.ReLU()
++        self.sigmoid = torch.nn.Sigmoid()
++    
++    def forward(self, energy_patch):
++        """
++        Input: energy_patch of shape (batch_size, 3, 3)
++        Output: distributed energies of shape (batch_size, 3, 3)
++        """
++        # Add channel dimension for Conv2d
++        x = energy_patch.unsqueeze(1)  # (batch_size, 1, 3, 3)
++        x = torch.ones_like(x)  # (batch_size, 1, 3, 3)
++        
++        # Forward pass through custom convolution
++        x = torch.nn.functional.conv2d(x, self.conv1_weight, self.conv1_bias, padding=1)
++        # x = self.relu(x)  # (batch_size, 1, 3, 3)
++        
++        # x = torch.nn.functional.conv2d(x, self.conv2_weight, self.conv2_bias, padding=1)
++        # x = self.sigmoid(x)  # (batch_size, 1, 3, 3)
++        
++        # Remove channel dimension
++        return x.squeeze(1)  # (batch_size, 3, 3)
++
+ # Initialize GPU handler
+ gpu_handler = GPUHandler()
+ device = gpu_handler.get_device()
+@@ -68,6 +113,9 @@ class OrganismManager:
+         self.new_cell_candidates = torch.zeros((world_size, world_size), dtype=torch.bool, device=device)
+         self._initialize_topology()
+         
++        # Initialize CNN for energy distribution
++        self.energy_distribution_cnn = EnergyDistributionCNN(device)
++        
+         # Reproduction parameters
+         self.reproduction_threshold = REPRODUCTION_THRESHOLD
+     
+@@ -86,28 +134,7 @@ class OrganismManager:
+         
+         # Check energy threshold on the new cell candidates
+         energy_mask = (self.energy_matrix >= self.reproduction_threshold) * self.new_cell_candidates
+-        
+-        # Count how many cells are being spawned
+-        num_spawned = torch.sum(energy_mask).item()
+-        
+-        # Reduce energy of parent cells by REPRODUCTION_THRESHOLD * spawned cells
+-        # Find parent cells (organisms that are adjacent to the new cells)
+-        parent_energy_reduction = REPRODUCTION_THRESHOLD * num_spawned/8
+-        
+-        # Create a mask for parent cells (organisms adjacent to new cells)
+-        parent_kernel = torch.ones((3, 3), device=device, dtype=torch.float32)
+-        parent_kernel[1, 1] = 0  # Don't include center cell
+-        
+-        # Find organisms adjacent to new cells
+-        parent_mask = torch.nn.functional.conv2d(
+-            energy_mask.unsqueeze(0).unsqueeze(0).to(torch.float32), 
+-            parent_kernel.unsqueeze(0).unsqueeze(0), 
+-            padding=1
+-        ).squeeze() > 0
+-        
+-        # # Reduce energy of parent cells
+-        #self.energy_matrix = torch.clamp(self.energy_matrix - parent_energy_reduction * parent_mask.float(), 0, 1)
+-        
++
+         # Add selected positions to topology
+         self.topology_matrix[energy_mask] = 1
+     
+@@ -133,16 +160,22 @@ class OrganismManager:
+         # Calculate how much energy each cell can share (only organisms can share)
+         shareable_energy = self.energy_matrix * self.topology_matrix * sharing_rate
+         
+-        # Create a 3x3 kernel for energy distribution (excluding center)
+-        kernel = torch.ones((3, 3), device=device, dtype=torch.float32)
+-        kernel[1, 1] = 0  # Don't include center cell
++        # Process energy distribution using vectorized operations
++        # Apply padding to handle edge cases
++        padded_energy = torch.nn.functional.pad(shareable_energy, (1, 1, 1, 1), mode='constant', value=0)
++        
++        # Extract all 3x3 patches at once using unfold
++        patches = padded_energy.unfold(0, 3, 1).unfold(1, 3, 1)  # (world_size, world_size, 3, 3)
++        patches = patches.contiguous().view(-1, 3, 3)  # (world_size*world_size, 3, 3)
++        
++        # Process all patches through CNN in batch
++        distributed_patches = self.energy_distribution_cnn(patches)  # (world_size*world_size, 3, 3)
++        
++        # Extract center values and reshape back to world matrix
++        distributed_energy = distributed_patches[:, 1, 1].view(self.world_size, self.world_size)
+         
+-        # Distribute energy to adjacent cells
+-        distributed_energy = torch.nn.functional.conv2d(
+-            shareable_energy.unsqueeze(0).unsqueeze(0).to(torch.float32), 
+-            kernel.unsqueeze(0).unsqueeze(0), 
+-            padding=1
+-        ).squeeze()
++        # Mask output to only apply energy where topology = 1
++        distributed_energy = distributed_energy * self.topology_matrix
+         
+         # Store mask of where energy is shared but topology = 0 (new cell candidates)
+         self.new_cell_candidates = (distributed_energy > self.reproduction_threshold) & (self.topology_matrix == 0)

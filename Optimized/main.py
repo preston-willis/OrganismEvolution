@@ -25,6 +25,40 @@ device = gpu_handler.get_device()
 # Global harvest rate (can be modified at runtime)
 current_harvest_rate = ENERGY_HARVEST_RATE
 
+class EnergyDistributionCNN(torch.nn.Module):
+    """CNN that distributes energy across the entire world grid using 3x3 convolution"""
+    def __init__(self, device):
+        super().__init__()
+        self.device = device
+        
+        # Create 3x3 kernel for energy distribution (excluding center)
+        kernel = torch.ones(3, 3, device=device, dtype=torch.float32)
+        kernel[1, 1] = 0  # Don't include center cell
+        
+        # Register as buffer for conv2d
+        self.register_buffer('kernel', kernel)
+        
+        # Move model to device
+        self.to(device)
+    
+    def forward(self, shareable_energy):
+        """
+        Input: shareable_energy of shape (world_size, world_size)
+        Output: distributed energies of shape (world_size, world_size)
+        """
+        # Add batch and channel dimensions for Conv2d
+        x = shareable_energy.unsqueeze(0).unsqueeze(0)  # (1, 1, world_size, world_size)
+        
+        # Apply convolution with same kernel as current implementation
+        x = torch.nn.functional.conv2d(x, self.kernel.unsqueeze(0).unsqueeze(0), padding=1)
+        
+        # Apply softmax to ensure output adds up to 1
+       # x = torch.nn.functional.softmax(x.view(-1), dim=0).view(x.shape)
+        
+        # Remove batch and channel dimensions
+        return x.squeeze(0).squeeze(0)  # (world_size, world_size)
+
+
 class Environment:
     def __init__(self, world_size, noise_scale, quantization_step):
         self.world_size = world_size
@@ -70,6 +104,9 @@ class OrganismManager:
         
         # Reproduction parameters
         self.reproduction_threshold = REPRODUCTION_THRESHOLD
+        
+        # Energy distribution CNN
+        self.energy_distribution_cnn = EnergyDistributionCNN(device)
     
     def _initialize_topology(self):
         """Initialize topology and energy with organism positions"""
@@ -86,27 +123,6 @@ class OrganismManager:
         
         # Check energy threshold on the new cell candidates
         energy_mask = (self.energy_matrix >= self.reproduction_threshold) * self.new_cell_candidates
-        
-        # Count how many cells are being spawned
-        num_spawned = torch.sum(energy_mask).item()
-        
-        # Reduce energy of parent cells by REPRODUCTION_THRESHOLD * spawned cells
-        # Find parent cells (organisms that are adjacent to the new cells)
-        parent_energy_reduction = REPRODUCTION_THRESHOLD * num_spawned/8
-        
-        # Create a mask for parent cells (organisms adjacent to new cells)
-        parent_kernel = torch.ones((3, 3), device=device, dtype=torch.float32)
-        parent_kernel[1, 1] = 0  # Don't include center cell
-        
-        # Find organisms adjacent to new cells
-        parent_mask = torch.nn.functional.conv2d(
-            energy_mask.unsqueeze(0).unsqueeze(0).to(torch.float32), 
-            parent_kernel.unsqueeze(0).unsqueeze(0), 
-            padding=1
-        ).squeeze() > 0
-        
-        # # Reduce energy of parent cells
-        #self.energy_matrix = torch.clamp(self.energy_matrix - parent_energy_reduction * parent_mask.float(), 0, 1)
         
         # Add selected positions to topology
         self.topology_matrix[energy_mask] = 1
@@ -133,16 +149,8 @@ class OrganismManager:
         # Calculate how much energy each cell can share (only organisms can share)
         shareable_energy = self.energy_matrix * self.topology_matrix * sharing_rate
         
-        # Create a 3x3 kernel for energy distribution (excluding center)
-        kernel = torch.ones((3, 3), device=device, dtype=torch.float32)
-        kernel[1, 1] = 0  # Don't include center cell
-        
-        # Distribute energy to adjacent cells
-        distributed_energy = torch.nn.functional.conv2d(
-            shareable_energy.unsqueeze(0).unsqueeze(0).to(torch.float32), 
-            kernel.unsqueeze(0).unsqueeze(0), 
-            padding=1
-        ).squeeze()
+        # Distribute energy to adjacent cells using CNN
+        distributed_energy = self.energy_distribution_cnn(shareable_energy)
         
         # Store mask of where energy is shared but topology = 0 (new cell candidates)
         self.new_cell_candidates = (distributed_energy > self.reproduction_threshold) & (self.topology_matrix == 0)
