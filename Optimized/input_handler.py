@@ -15,6 +15,8 @@ class InputHandler:
         print("Controls:")
         print("  'q' - Quit")
         print("  'm' - Toggle render mode (red dots / green dots)")
+        print("  'n' - Toggle filters (enabled: organisms, disabled: environment only)")
+        print("  'h' - Toggle harvest rate (enabled: 0.2, disabled: 0)")
         print("  'v' - Toggle large dots (10x size)")
         print("  'p' - Toggle performance mode (disable expensive rendering)")
         print("  Ctrl+C - Force quit")

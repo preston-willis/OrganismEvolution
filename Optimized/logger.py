@@ -59,7 +59,7 @@ class Logger:
         """Get current FPS"""
         return getattr(self, 'current_fps', 0.0)
     
-    def log_tick(self, tick, tick_time, debug_info, topology_info=None, energy_levels=None):
+    def log_tick(self, tick, tick_time, debug_info, topology_info=None, energy_levels=None, total_energy=None, total_terrain=None, system_energy=None):
         """Log tick information with FPS"""
         # Get current FPS
         fps = self.get_fps()
@@ -73,5 +73,11 @@ class Logger:
             print(f"  {topology_info}")
         if energy_levels is not None:
             print(f"  Energy: {energy_levels}")
+        if total_energy is not None:
+            print(f"  Organism Energy: {total_energy:.6f}")
+        if total_terrain is not None:
+            print(f"  Terrain Energy: {total_terrain:.6f}")
+        if system_energy is not None:
+            print(f"  System Energy: {system_energy:.6f}")
         print(f"  Uptime: {debug_info['uptime']:.1f}s")
         print()

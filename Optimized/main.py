@@ -22,6 +22,9 @@ from input_handler import InputHandler
 gpu_handler = GPUHandler()
 device = gpu_handler.get_device()
 
+# Global harvest rate (can be modified at runtime)
+current_harvest_rate = ENERGY_HARVEST_RATE
+
 class Environment:
     def __init__(self, world_size, noise_scale, quantization_step):
         self.world_size = world_size
@@ -38,22 +41,21 @@ class Environment:
                 perlin_values[i, j] = pnoise2(i * self.noise_scale * NOISE_FREQUENCY_MULTIPLIER, j * self.noise_scale * NOISE_FREQUENCY_MULTIPLIER, octaves=NOISE_OCTAVES)
         
         # Normalize to 0-1
-        perlin_values = (perlin_values - perlin_values.min()) / (perlin_values.max() - perlin_values.min())
+        perlin_values = (perlin_values - perlin_values.min()) / (max(perlin_values.max() - perlin_values.min(), 1e-6))
         
         # Apply power function to create more low energy zones
         perlin_values = np.power(perlin_values, NOISE_POWER)
-        
-        # Quantize
-        terrain = np.round(perlin_values / self.quantization_step) * self.quantization_step
-        terrain = np.clip(terrain, 0, 1)
-        
+
+        perlin_values = torch.tensor(perlin_values, dtype=torch.float32, device=device)
+        dead_mask = perlin_values > 0
+        perlin_values = perlin_values * dead_mask    
         # Convert to tensor
-        return torch.tensor(terrain, dtype=torch.float16, device=device)
+        return torch.clamp(perlin_values, 0, 1)
     
-    def compute_environment(self, topology_matrix):
+    def compute_environment(self, topology_matrix, harvested_energy):
         """Modify environment based on organism presence"""
-        # Set environment to 0 where organisms exist
-        self.terrain = torch.where(topology_matrix > 0, torch.tensor(0.0, device=device), self.terrain)
+        # Deplete terrain energy by the amount harvested
+        self.terrain = torch.clamp(self.terrain - (harvested_energy * topology_matrix), 0, 1)
 
 class OrganismManager:
     def __init__(self, world_size, organism_count, terrain):
@@ -61,84 +63,68 @@ class OrganismManager:
         self.terrain = terrain
 
         self.positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
-        self.topology_matrix = torch.zeros((world_size, world_size), dtype=torch.float16, device=device)
-        self.energy_matrix = terrain.clone()
+        self.topology_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
+        self.energy_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
         self.new_cell_candidates = torch.zeros((world_size, world_size), dtype=torch.bool, device=device)
         self._initialize_topology()
         
         # Reproduction parameters
         self.reproduction_threshold = REPRODUCTION_THRESHOLD
-        self.reproduction_probability = REPRODUCTION_PROBABILITY
     
     def _initialize_topology(self):
         """Initialize topology and energy with organism positions"""
         if self.positions.numel() > 0:
             y_coords, x_coords = self.positions[:, 1], self.positions[:, 0]
             self.topology_matrix[y_coords, x_coords] = 1
+            self.energy_matrix[y_coords, x_coords] = 1
     
     def compute_topology(self):
-        """Add random adjacent cells to topology using efficient convolution"""
-        # Use convolution to find adjacent empty cells efficiently
-        # Create a 3x3 kernel to find adjacent positions
-        kernel = torch.ones((3, 3), device=device, dtype=torch.float16)
-        kernel[1, 1] = 0  # Don't count the center cell itself
+        """Reproduce using new_cell_candidates mask from energy sharing"""
+        # Use new_cell_candidates mask for reproduction instead of random selection
+        if not torch.any(self.new_cell_candidates):
+            return
         
-        # Convolve to find adjacent cells to existing organisms
-        adjacent_count = torch.nn.functional.conv2d(
-            self.topology_matrix.unsqueeze(0).unsqueeze(0), 
-            kernel.unsqueeze(0).unsqueeze(0), 
+        # Check energy threshold on the new cell candidates
+        energy_mask = (self.energy_matrix >= self.reproduction_threshold) * self.new_cell_candidates
+        
+        # Count how many cells are being spawned
+        num_spawned = torch.sum(energy_mask).item()
+        
+        # Reduce energy of parent cells by REPRODUCTION_THRESHOLD * spawned cells
+        # Find parent cells (organisms that are adjacent to the new cells)
+        parent_energy_reduction = REPRODUCTION_THRESHOLD * num_spawned/8
+        
+        # Create a mask for parent cells (organisms adjacent to new cells)
+        parent_kernel = torch.ones((3, 3), device=device, dtype=torch.float32)
+        parent_kernel[1, 1] = 0  # Don't include center cell
+        
+        # Find organisms adjacent to new cells
+        parent_mask = torch.nn.functional.conv2d(
+            energy_mask.unsqueeze(0).unsqueeze(0).to(torch.float32), 
+            parent_kernel.unsqueeze(0).unsqueeze(0), 
             padding=1
-        ).squeeze()
+        ).squeeze() > 0
         
-        # Find positions that are adjacent to organisms but not occupied
-        adjacent_mask = (adjacent_count > 0) & (self.topology_matrix == 0)
+        # # Reduce energy of parent cells
+        #self.energy_matrix = torch.clamp(self.energy_matrix - parent_energy_reduction * parent_mask.float(), 0, 1)
         
-        if not torch.any(adjacent_mask):
-            return
-        
-        # Check energy threshold directly on the mask
-        energy_mask = (self.energy_matrix >= self.reproduction_threshold) & adjacent_mask
-        
-        if not torch.any(energy_mask):
-            return
-        
-        # Random selection using probability - apply directly to the mask
-        random_values = torch.rand_like(self.topology_matrix, dtype=torch.float16)
-        selected_mask = (random_values < self.reproduction_probability) & energy_mask
-        
-        if torch.any(selected_mask):
-            # Count how many cells are being spawned
-            num_spawned = torch.sum(selected_mask).item()
-            
-            # Reduce energy of parent cells by REPRODUCTION_THRESHOLD * spawned cells
-            # Find parent cells (organisms that are adjacent to the new cells)
-            parent_energy_reduction = REPRODUCTION_THRESHOLD * num_spawned/8
-            
-            # Create a mask for parent cells (organisms adjacent to new cells)
-            parent_kernel = torch.ones((3, 3), device=device, dtype=torch.float16)
-            parent_kernel[1, 1] = 0  # Don't include center cell
-            
-            # Find organisms adjacent to new cells
-            parent_mask = torch.nn.functional.conv2d(
-                selected_mask.unsqueeze(0).unsqueeze(0).to(torch.float16), 
-                parent_kernel.unsqueeze(0).unsqueeze(0), 
-                padding=1
-            ).squeeze() > 0
-            
-            # Reduce energy of parent cells
-            self.energy_matrix = torch.clamp(self.energy_matrix - parent_energy_reduction * parent_mask.float(), 0, 1)
-            
-            # Add selected positions to topology
-            self.topology_matrix[selected_mask] = 1
+        # Add selected positions to topology
+        self.topology_matrix[energy_mask] = 1
     
-    def compute_energy(self):
+    def compute_energy(self, terrain):
         """Deplete all energies by ENERGY_DECAY and allow energy sharing between adjacent cells"""
-        # Apply energy decay only where topology = 1 (organisms)
-        self.energy_matrix = torch.clamp(self.energy_matrix - ENERGY_DECAY * self.topology_matrix, 0, 1)
-        
+        # Set organism energy to 1 in a 20-radius area BEFORE energy sharing calculation
+        if terrain is not None:
+            self.terrain = terrain
+                
         # Remove organisms with energy below quantization step
-        low_energy_mask = self.energy_matrix < QUANTIZATION_STEP
+        low_energy_mask = self.energy_matrix < DEATH_THRESHOLD
         self.topology_matrix[low_energy_mask] = 0
+        
+        # Apply energy decay only where topology = 1 (organisms)
+        # Harvest energy from terrain where topology = 1, max harvest = ENERGY_HARVEST_RATE
+        harvested_energy = torch.minimum(self.terrain, torch.tensor(current_harvest_rate, device=device))
+        self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - ENERGY_DECAY) * self.topology_matrix, 0, 1)
         
         
         # Energy sharing between adjacent cells (conserving total energy)
@@ -148,47 +134,36 @@ class OrganismManager:
         shareable_energy = self.energy_matrix * self.topology_matrix * sharing_rate
         
         # Create a 3x3 kernel for energy distribution (excluding center)
-        kernel = torch.ones((3, 3), device=device, dtype=torch.float16)
+        kernel = torch.ones((3, 3), device=device, dtype=torch.float32)
         kernel[1, 1] = 0  # Don't include center cell
         
         # Distribute energy to adjacent cells
         distributed_energy = torch.nn.functional.conv2d(
-            shareable_energy.unsqueeze(0).unsqueeze(0).to(torch.float16), 
+            shareable_energy.unsqueeze(0).unsqueeze(0).to(torch.float32), 
             kernel.unsqueeze(0).unsqueeze(0), 
             padding=1
         ).squeeze()
         
-        # Only organisms can receive energy
-        receiving_mask = self.topology_matrix > 0
-        
         # Store mask of where energy is shared but topology = 0 (new cell candidates)
-        self.new_cell_candidates = (distributed_energy > 0) & (self.topology_matrix == 0)
+        self.new_cell_candidates = (distributed_energy > self.reproduction_threshold) & (self.topology_matrix == 0)
+        
+        # Only organisms can receive energy
+        receiving_mask = (self.topology_matrix + self.new_cell_candidates) > 0
         
         if torch.any(receiving_mask):
-            # Calculate how much energy each cell can receive (proportional to available space)
-            energy_deficit = 1.0 - self.energy_matrix
-            total_deficit = torch.nn.functional.conv2d(
-                energy_deficit.unsqueeze(0).unsqueeze(0).to(torch.float16), 
-                kernel.unsqueeze(0).unsqueeze(0), 
-                padding=1
-            ).squeeze()
-            
-            # Avoid division by zero
-            total_deficit = torch.clamp(total_deficit, min=1e-6)
-            
-            # Calculate energy to receive based on proportional deficit
-            energy_to_receive = distributed_energy * (energy_deficit / total_deficit) * receiving_mask.float()
-            
-            # Remove shared energy from source cells
+            # Remove shared energy from source cells FIRST
             self.energy_matrix = torch.clamp(self.energy_matrix - shareable_energy, 0, 1)
             
-            # Add received energy to destination cells
-            self.energy_matrix = torch.clamp(self.energy_matrix + energy_to_receive, 0, 1)
-            
+            # Add distributed energy to destination cells (scale by 1/8 to conserve energy)
+            # Each cell shares with 8 neighbors, so we need to divide by 8
+            self.energy_matrix = torch.clamp(self.energy_matrix + (distributed_energy / 8.0) * receiving_mask.float(), 0, 1)
+        
+        return harvested_energy
 class Renderer:
     def __init__(self, world_size):
         self.world_size = world_size
         self.render_mode = "org_energy"  # "org_top" or "org_energy"
+        self.filters_enabled = True  # True = show organisms, False = environment only
         self.texture_id = None
         self.quad_vbo = None
         self.opengl_initialized = False
@@ -198,35 +173,45 @@ class Renderer:
         self.render_mode = "org_energy" if self.render_mode == "org_top" else "org_top"
         print(f"Render mode: {self.render_mode}")
     
+    def toggle_filters(self):
+        """Toggle between showing organisms (enabled) and environment only (disabled)"""
+        self.filters_enabled = not self.filters_enabled
+        if self.filters_enabled:
+            print(f"Filters enabled - showing organisms ({self.render_mode})")
+        else:
+            print("Filters disabled - showing environment only")
+    
     def render(self, environment, topology, mask, new_cell_candidates=None):
         """Render the current state using PyTorch tensors directly - GPU accelerated"""
         env_scaled = environment.clamp(0, 1)
         
         # Create RGB image tensor
-        image = torch.zeros((3, self.world_size, self.world_size), device=device, dtype=torch.float16)
+        image = torch.zeros((3, self.world_size, self.world_size), device=device, dtype=torch.float32)
         
         # Apply environment to all channels
         image[0] = env_scaled  # Red channel
         image[1] = env_scaled  # Green channel  
         image[2] = env_scaled  # Blue channel
         
-        # Apply mask where topology = 1
-        if self.render_mode == "org_top":
-            # Red topology
-            image[0] = topology * 1.0 + (1 - topology) * env_scaled
-            image[1] = topology * 0.0 + (1 - topology) * env_scaled
-            image[2] = topology * 0.0 + (1 - topology) * env_scaled
-        else:
-            # Green energy
-            image[0] = topology * 0.0 + (1 - topology) * env_scaled
-            image[1] = topology * mask + (1 - topology) * env_scaled
-            image[2] = topology * 0.0 + (1 - topology) * env_scaled
-        
-        # Render new cell candidates as blue
-        if new_cell_candidates is not None:
-            image[0] = new_cell_candidates.float() * 0.0 + (1 - new_cell_candidates.float()) * image[0]
-            image[1] = new_cell_candidates.float() * 0.0 + (1 - new_cell_candidates.float()) * image[1]
-            image[2] = new_cell_candidates.float() * 1.0 + (1 - new_cell_candidates.float()) * image[2]
+        # Only apply organism visualization if filters are enabled
+        if self.filters_enabled:
+            # Apply mask where topology = 1
+            if self.render_mode == "org_top":
+                # Red topology
+                image[0] = topology * 1.0 + (1 - topology) * env_scaled
+                image[1] = topology * 0.0 + (1 - topology) * env_scaled
+                image[2] = topology * 0.0 + (1 - topology) * env_scaled
+            else:
+                # Green energy
+                image[0] = topology * 0.0 + (1 - topology) * env_scaled
+                image[1] = topology * mask + (1 - topology) * env_scaled
+                image[2] = topology * 0.0 + (1 - topology) * env_scaled
+            
+            # Render new cell candidates as blue
+            if new_cell_candidates is not None:
+                image[0] = new_cell_candidates.float() * 0.0 + (1 - new_cell_candidates.float()) * image[0]
+                image[1] = new_cell_candidates.float() * 0.0 + (1 - new_cell_candidates.float()) * image[1]
+                image[2] = new_cell_candidates.float() * 1.0 + (1 - new_cell_candidates.float()) * image[2]
         
         return image
     
@@ -315,20 +300,25 @@ class Simulation:
     
     def update_simulation(self):
         """Update one simulation tick"""
+                
+        # Compute energy decay and sharing
+        harvested_energy = self.organism_manager.compute_energy(self.environment.terrain)
+        
         # DISABLE topology expansion (major CPU bottleneck)
         self.organism_manager.compute_topology()
         
-        # Compute energy decay and sharing
-        self.organism_manager.compute_energy()
-        
         # Compute environment changes
-        self.environment.compute_environment(self.organism_manager.topology_matrix)
+        self.environment.compute_environment(self.organism_manager.topology_matrix, harvested_energy)
         
         self.logger.update_fps()
        
         debug_info = self.logger.get_debug_info()
         if self.tick % DEBUG_PRINT_INTERVAL == 0:
-            self.logger.log_tick(self.tick, 0, debug_info, None, None)
+            # Debug: Log total energy in system and terrain
+            total_energy = torch.sum(self.organism_manager.energy_matrix).item()
+            total_terrain = torch.sum(self.environment.terrain).item()
+            system_energy = total_energy + total_terrain
+            self.logger.log_tick(self.tick, 0, debug_info, None, None, total_energy, total_terrain, system_energy)
        
         # Clear GPU cache periodically
         if self.tick % GPU_CACHE_CLEAR_INTERVAL == 0:
@@ -401,12 +391,23 @@ def main():
     
     def keyboard(key, x, y):
         """OpenGL keyboard callback"""
-        global current_renderer
+        global current_renderer, current_simulation
         
         if key == b'q' or key == 27:  # 'q' or ESC
             glut.glutLeaveMainLoop()
         elif key == b'm':
             current_renderer.toggle_render_mode()
+        elif key == b'n':
+            current_renderer.toggle_filters()
+        elif key == b'h':
+            # Toggle harvest rate between 0 and original value
+            global current_harvest_rate
+            if current_harvest_rate == 0:
+                current_harvest_rate = ENERGY_HARVEST_RATE
+                print(f"Harvest rate enabled: {ENERGY_HARVEST_RATE}")
+            else:
+                current_harvest_rate = 0
+                print("Harvest rate disabled: 0")
     
     # Frame rate control - ONLY for rendering/OpenGL
     rendering_frame_counter = 0
