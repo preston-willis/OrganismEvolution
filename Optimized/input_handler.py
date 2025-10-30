@@ -17,6 +17,9 @@ class InputHandler:
         print("  'm' - Toggle render mode (red dots / green dots)")
         print("  'n' - Toggle filters (enabled: organisms, disabled: environment only)")
         print("  'h' - Toggle harvest rate (enabled: 0.2, disabled: 0)")
+        # Training is now started via --train CLI flag
+        print("  'r' - Toggle replay mode (show best organism from training)")
+        print("  'd' - Toggle debug text overlay")
         print("  'v' - Toggle large dots (10x size)")
         print("  'p' - Toggle performance mode (disable expensive rendering)")
         print("  Ctrl+C - Force quit")

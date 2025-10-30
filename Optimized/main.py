@@ -10,13 +10,19 @@ import OpenGL.GLUT as glut
 from OpenGL.GL import *
 from OpenGL.GLUT import *
 from OpenGL.arrays import vbo
+from OpenGL.GL import glRasterPos2f, glCallLists
 import ctypes
+import uuid
+import random
+from concurrent.futures import ThreadPoolExecutor
 
 # Import our modules
 from config import *
 from gpu_handler import GPUHandler
 from logger import Logger
 from input_handler import InputHandler
+from Grapher import Grapher
+import argparse
 
 # Initialize GPU handler
 gpu_handler = GPUHandler()
@@ -25,6 +31,10 @@ device = gpu_handler.get_device()
 # Global harvest rate (can be modified at runtime)
 current_harvest_rate = ENERGY_HARVEST_RATE
 
+# Global best CNN for replay
+current_best_cnn = None
+replay_mode = False
+
 class EnergyDistributionCNN(torch.nn.Module):
     """CNN that distributes energy across the entire world grid using 3x3 convolution"""
     def __init__(self, device):
@@ -32,31 +42,354 @@ class EnergyDistributionCNN(torch.nn.Module):
         self.device = device
         
         # Create 3x3 kernel for energy distribution (excluding center)
-        kernel = torch.ones(3, 3, device=device, dtype=torch.float32)
-        kernel[1, 1] = 0  # Don't include center cell
+        kernel = torch.tensor([[-12.8405, -10.0789, -13.9634],
+        [ -5.2370, -13.8395, -10.9243],
+        [ -4.8459,  -7.6581,  -6.9305]], device='mps:0')
+        # kernel[1, 1] = 0  # Don't include center cell
         
         # Register as buffer for conv2d
         self.register_buffer('kernel', kernel)
         
         # Move model to device
         self.to(device)
-    
+        
     def forward(self, shareable_energy):
         """
         Input: shareable_energy of shape (world_size, world_size)
         Output: distributed energies of shape (world_size, world_size)
         """
-        # Add batch and channel dimensions for Conv2d
-        x = shareable_energy.unsqueeze(0).unsqueeze(0)  # (1, 1, world_size, world_size)
+        # Prepare input with batch/channel dims
+        x = shareable_energy.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+
+        # Convolution using the stored kernel
+        out = torch.nn.functional.conv2d(x, self.kernel.unsqueeze(0).unsqueeze(0), padding=1)
+
+        # Softmax each 3x3 locality on the OUTPUT (destination gets a per-source 3x3 distribution)
+        patches_out = torch.nn.functional.unfold(out, kernel_size=3, padding=1)  # (1, 9, H*W)
+        local_probs = torch.nn.functional.softmax(patches_out, dim=1)            # (1, 9, H*W)
+        center_idx = 4
+        H, W = out.shape[-2:]
+
+        # Source-only gating and scaling: use the input shareable center per source
+        patches_in = torch.nn.functional.unfold(x, kernel_size=3, padding=1)     # (1, 9, H*W)
+        center_energy = patches_in[:, center_idx:center_idx+1, :]                # (1,1,H*W)
+        gated_weighted = local_probs * center_energy                              # (1,9,H*W)
+
+        # Fold back to accumulate contributions from all sources into destinations
+        distributed = torch.nn.functional.fold(gated_weighted, output_size=(H, W), kernel_size=3, padding=1)  # (1,1,H,W)
+
+        return distributed.squeeze(0).squeeze(0)
+
+
+class CNNGeneticAlgorithm:
+    """Genetic algorithm for training CNN weights with parallel GPU evaluation"""
+    def __init__(self, pop_size, mut_rate, mut_mag, device):
+        self.pop_size = pop_size
+        self.mut_rate = mut_rate
+        self.mut_mag = mut_mag
+        self.device = device
+        self.fittest_index = 0
+        self.run_id = str(uuid.uuid1())[:4]
         
-        # Apply convolution with same kernel as current implementation
-        x = torch.nn.functional.conv2d(x, self.kernel.unsqueeze(0).unsqueeze(0), padding=1)
+        # Initialize population of CNNs
+        self.subjects = [EnergyDistributionCNN(device) for _ in range(pop_size)]
+        self.fitness_scores = [0.0] * pop_size
         
-        # Apply softmax to ensure output adds up to 1
-       # x = torch.nn.functional.softmax(x.view(-1), dim=0).view(x.shape)
+        # Create batched kernel for parallel evaluation
+        self.batched_kernels = torch.stack([cnn.kernel for cnn in self.subjects])  # (pop_size, 3, 3)
         
-        # Remove batch and channel dimensions
-        return x.squeeze(0).squeeze(0)  # (world_size, world_size)
+    def reset_fitness(self):
+        """Reset all fitness scores"""
+        self.fitness_scores = [0.0] * self.pop_size
+        
+    def compute_generation(self):
+        """Run one generation of evolution"""
+        self.calc_fittest()
+        
+        # Save best model if fitness > 0
+        # if self.fitness_scores[self.fittest_index] > 0:
+        #     self.save_model(self.fittest_index)
+            
+        # Crossover and mutation
+        self.crossover(self.subjects[self.fittest_index])
+        self.mutate()
+        
+    def calc_fittest(self):
+        """Find the fittest individual"""
+        best_fitness = 0
+        best_index = 0
+        for i, fitness in enumerate(self.fitness_scores):
+            if fitness > best_fitness:
+                best_fitness = fitness
+                best_index = i
+        self.fittest_index = best_index
+        
+    def update_batched_kernels(self):
+        """Update the batched kernels from individual CNNs"""
+        self.batched_kernels = torch.stack([cnn.kernel for cnn in self.subjects])
+        
+    def crossover(self, parent):
+        """Copy parent weights to all subjects"""
+        for i in range(self.pop_size):
+            if i != self.fittest_index:  # Don't overwrite the parent
+                # Copy kernel weights
+                self.subjects[i].kernel.data = parent.kernel.data.clone()
+        
+        # Update batched kernels
+        self.update_batched_kernels()
+                
+    def mutate(self):
+        """Apply mutations to all subjects except the fittest"""
+        for i in range(self.pop_size):
+            if i != self.fittest_index:  # Don't mutate the fittest
+                # Create mutation mask
+                mutation_mask = torch.rand_like(self.subjects[i].kernel) < self.mut_rate
+                
+                # Generate random mutations
+                mutations = (torch.rand_like(self.subjects[i].kernel) - 0.5) * 2 * self.mut_mag
+                
+                # Apply mutations
+                self.subjects[i].kernel.data[mutation_mask] += mutations[mutation_mask]
+                
+                # # Ensure center remains 0 (no self-connection)
+                # self.subjects[i].kernel.data[1, 1] = 0
+        
+        # Update batched kernels
+        self.update_batched_kernels()
+                
+    def save_model(self, index):
+        """Save model weights to file"""
+        filename = f'data/cnn_{self.run_id}_{self.fitness_scores[index]:.6f}.pt'
+        torch.save(self.subjects[index].state_dict(), filename)
+        print(f"Saved model: {filename}")
+        
+    def load_model(self, filename):
+        """Load model weights from file"""
+        try:
+            state_dict = torch.load(filename, map_location=self.device)
+            self.subjects[0].load_state_dict(state_dict)
+            print(f"Loaded model: {filename}")
+        except Exception as e:
+            print(f"Couldn't load {filename}: {e}")
+
+
+class ParallelCNNEvaluator:
+    """Parallel CNN evaluator for GPU-accelerated fitness computation"""
+    def __init__(self, world_size, max_time, device):
+        self.world_size = world_size
+        self.max_time = max_time
+        self.device = device
+        self.grapher = None
+        self.current_generation_max_fitness = 0.0
+        
+    def evaluate_population_parallel(self, batched_kernels, pop_size):
+        """Evaluate entire population in parallel on GPU using threading"""
+        
+        # Create simulation instances for each CNN (debug disabled during training)
+        simulations = []
+        for i in range(pop_size):
+            sim = Simulation(enable_debug=False)
+            # Replace the CNN with a custom one using the batched kernel
+            sim.organism_manager.energy_distribution_cnn = self._create_cnn_from_kernel(batched_kernels[i])
+            simulations.append(sim)
+        
+        # Run simulations in parallel using ThreadPoolExecutor
+        fitness_scores = [0.0] * pop_size
+        
+        def evaluate_single(i, sim):
+            fitness_scores[i] = self._evaluate_single_cnn(sim, bot_index=i)
+        
+        # Use ThreadPoolExecutor for parallel execution, continuously pump GUI
+        import time as _time
+        with ThreadPoolExecutor(max_workers=min(pop_size, 64)) as executor:
+            futures = [executor.submit(evaluate_single, i, sim) for i, sim in enumerate(simulations)]
+            # While evaluations are running, keep the matplotlib window responsive
+            while True:
+                all_done = True
+                for f in futures:
+                    if not f.done():
+                        all_done = False
+                        break
+                if self.grapher is not None:
+                    try:
+                        self.grapher.process_queued()
+                    except Exception:
+                        pass
+                if all_done:
+                    break
+                _time.sleep(0.03)
+
+            # Ensure exceptions are surfaced
+            for f in futures:
+                f.result()
+        
+        return fitness_scores
+    
+    def _create_cnn_from_kernel(self, kernel):
+        """Create a CNN with a specific kernel"""
+        cnn = EnergyDistributionCNN(self.device)
+        cnn.kernel.data = kernel.clone()
+        return cnn
+    
+    def _evaluate_single_cnn(self, simulation, bot_index: int | None = None):
+        """Evaluate a single CNN simulation"""
+        total_energy = 0
+        energy_history = []
+        
+        # Run simulation for max_time steps
+        for t in range(self.max_time):
+            sim_data = simulation.update_simulation()
+            
+            # Calculate fitness based on total energy and stability
+            current_energy = torch.sum(simulation.organism_manager.energy_matrix).item()
+            total_energy += current_energy
+            energy_history.append(current_energy)
+
+            # Tick graph update every 10 ticks if grapher attached
+            if self.grapher is not None and t % 10 == 0:
+                org_energy = current_energy
+                env_energy = torch.sum(simulation.environment.terrain).item()
+                total = org_energy + env_energy
+                # enqueue only; GUI update happens in main thread
+                self.grapher.enqueue_tick(t, self.current_generation_max_fitness, [current_energy], org_energy, env_energy, total)
+                if bot_index is not None:
+                    self.grapher.enqueue_bot_tick(bot_index, t, current_energy, org_energy, env_energy, total)
+            
+            # Early termination if energy drops too low
+            if current_energy < CNN_FITNESS_EARLY_TERMINATION_THRESHOLD:
+                break
+                
+        # Fitness is based on total energy and energy stability
+        avg_energy = total_energy / len(energy_history) if energy_history else 0
+        
+        fitness = avg_energy
+        return fitness
+
+
+class CNNEvolutionDriver:
+    """Evolution driver for CNN training with parallel GPU evaluation and replay"""
+    def __init__(self, world_size, epochs=CNN_DEFAULT_EPOCHS, max_time=CNN_DEFAULT_MAX_TIME):
+        self.world_size = world_size
+        self.epochs = epochs
+        self.max_time = max_time
+        
+        # Genetic algorithm parameters
+        self.ga = CNNGeneticAlgorithm(CNN_POPULATION_SIZE, CNN_MUTATION_RATE, CNN_MUTATION_MAGNITUDE, device)
+        
+        # Parallel evaluator
+        self.evaluator = ParallelCNNEvaluator(world_size, max_time, device)
+        self.grapher = None
+        
+        # Replay simulation for showing best organism
+        self.replay_simulation = None
+        
+    def evaluate_cnn(self, cnn, simulation):
+        """Evaluate a CNN by running simulation and measuring fitness"""
+        # Create a copy of simulation with this CNN (debug disabled during training)
+        test_sim = Simulation(enable_debug=False)
+        test_sim.organism_manager.energy_distribution_cnn = cnn
+        
+        total_energy = 0
+        energy_history = []
+        
+        # Run simulation for max_time steps
+        for t in range(self.max_time):
+            sim_data = test_sim.update_simulation()
+            
+            # Calculate fitness based on total energy and stability
+            current_energy = torch.sum(test_sim.organism_manager.energy_matrix).item()
+            total_energy += current_energy
+            energy_history.append(current_energy)
+            
+            # Early termination if energy drops too low
+            if current_energy < CNN_FITNESS_EARLY_TERMINATION_THRESHOLD:
+                break
+                
+        # Fitness is based on total energy and energy stability
+        avg_energy = total_energy / len(energy_history) if energy_history else 0
+
+        fitness = avg_energy
+        return fitness
+    
+    def create_replay_simulation(self, best_cnn):
+        """Create a simulation for replaying the best organism"""
+        global current_best_cnn, replay_mode
+        
+        # Create new simulation with the best CNN
+        self.replay_simulation = Simulation()
+        self.replay_simulation.organism_manager.energy_distribution_cnn = best_cnn
+        
+        # Update global variables
+        current_best_cnn = best_cnn
+        replay_mode = True
+        
+        # Store replay simulation in main simulation for access (only if OpenGL sim is running)
+        if 'current_simulation' in globals():
+            try:
+                current_simulation.replay_simulation = self.replay_simulation
+            except Exception:
+                pass
+        
+        print(f"Created replay simulation with best CNN (fitness: {self.ga.fitness_scores[self.ga.fittest_index]:.6f})")
+        print("Press 'r' to toggle replay mode and see the best organism in action!")
+        
+    def run_evolution(self):
+        """Run the evolution process with parallel GPU evaluation"""
+        print(f"\nStarting CNN Evolution - {self.epochs} generations")
+        print(f"Population size: {CNN_POPULATION_SIZE}")
+        print(f"Using parallel GPU evaluation")
+        
+        for gen in range(self.epochs):
+            print(f"\nGeneration {gen + 1}/{self.epochs}")
+            
+            # Evaluate entire population in parallel
+            print("Evaluating population in parallel...")
+            if self.grapher is not None:
+                self.evaluator.grapher = self.grapher
+            fitness_scores = self.evaluator.evaluate_population_parallel(
+                self.ga.batched_kernels, 
+                CNN_POPULATION_SIZE
+            )
+            
+            # Update fitness scores
+            self.ga.fitness_scores = fitness_scores
+            
+            # Print individual results
+            for i, fitness in enumerate(fitness_scores):
+                print(f"CNN {i}: fitness = {fitness:.6f}")
+                
+            # Run one generation
+            self.ga.compute_generation()
+            
+            # Print summary
+            best_fitness = self.ga.fitness_scores[self.ga.fittest_index]
+            print(f"Best fitness: {best_fitness:.6f}")
+            print(f"Best CNN kernel:\n{self.ga.subjects[self.ga.fittest_index].kernel.data}")
+            
+            # Create replay simulation with best organism
+            best_cnn = self.ga.subjects[self.ga.fittest_index]
+            self.create_replay_simulation(best_cnn)
+
+            # Update generation plot
+            if self.grapher is not None:
+                # track history of best fitness
+                if not hasattr(self, 'best_history'):
+                    self.best_history = []
+                self.best_history.append(best_fitness)
+                # update evaluator context
+                self.evaluator.grapher = self.grapher
+                self.evaluator.current_generation_max_fitness = best_fitness
+                # include per-bot fitnesses for colored series
+                self.grapher.enqueue_generation(gen + 1, self.best_history, fitness_scores)
+                self.grapher.process_queued()
+                # Clear tick-series for next generation window
+                self.grapher.reset_tick_metrics()
+            
+            # Reset for next generation
+            self.ga.reset_fitness()
+            
+        print("\nEvolution completed!")
+        return self.ga.subjects[self.ga.fittest_index]
 
 
 class Environment:
@@ -81,7 +414,7 @@ class Environment:
         perlin_values = np.power(perlin_values, NOISE_POWER)
 
         perlin_values = torch.tensor(perlin_values, dtype=torch.float32, device=device)
-        dead_mask = perlin_values > 0
+        dead_mask = perlin_values > 0.3
         perlin_values = perlin_values * dead_mask    
         # Convert to tensor
         return torch.clamp(perlin_values, 0, 1)
@@ -164,7 +497,7 @@ class OrganismManager:
             
             # Add distributed energy to destination cells (scale by 1/8 to conserve energy)
             # Each cell shares with 8 neighbors, so we need to divide by 8
-            self.energy_matrix = torch.clamp(self.energy_matrix + (distributed_energy / 8.0) * receiving_mask.float(), 0, 1)
+            self.energy_matrix = torch.clamp(self.energy_matrix + (distributed_energy) * receiving_mask.float(), 0, 1)
         
         return harvested_energy
 class Renderer:
@@ -175,6 +508,7 @@ class Renderer:
         self.texture_id = None
         self.quad_vbo = None
         self.opengl_initialized = False
+        self.debug_text_enabled = True
     
     def toggle_render_mode(self):
         """Toggle between organism topology and energy visualization"""
@@ -188,6 +522,114 @@ class Renderer:
             print(f"Filters enabled - showing organisms ({self.render_mode})")
         else:
             print("Filters disabled - showing environment only")
+    
+    def toggle_debug_text(self):
+        """Toggle debug text display"""
+        self.debug_text_enabled = not self.debug_text_enabled
+        if self.debug_text_enabled:
+            print("Debug text enabled")
+        else:
+            print("Debug text disabled")
+    
+    def render_text(self, x, y, text):
+        """Render text at specified position"""
+        try:
+            glRasterPos2f(x, y)
+            for char in text:
+                glut.glutBitmapCharacter(glut.GLUT_BITMAP_8_BY_13, ord(char))
+        except Exception as e:
+            print(f"Text rendering error: {e}")
+    
+    def render_debug_info(self, simulation_data, current_harvest_rate, replay_mode, current_best_cnn):
+        """Render debug information overlay"""
+        if not self.debug_text_enabled:
+            return
+        
+#        print(f"Rendering debug info: {len(lines)} lines")  # Debug output
+            
+        # Save current OpenGL state
+        glPushAttrib(GL_ALL_ATTRIB_BITS)
+        glMatrixMode(GL_PROJECTION)
+        glPushMatrix()
+        glLoadIdentity()
+        glOrtho(0, self.world_size, self.world_size, 0, -1, 1)  # Flip Y axis
+        glMatrixMode(GL_MODELVIEW)
+        glPushMatrix()
+        glLoadIdentity()
+        
+        # Disable depth testing and enable blending for text
+        glDisable(GL_DEPTH_TEST)
+        glEnable(GL_BLEND)
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+        
+        # Set text color (bright green with slight transparency)
+        glColor4f(0.0*255, 1.0*255, 0.0*255, 0.95*255)
+        
+        # Calculate text position (top-left corner, flipped coordinates)
+        text_x = 10
+        text_y = 20
+        line_height = 15
+        
+        # Render debug information
+        lines = [
+            f"DEBUG TEXT TEST - VISIBLE?",
+            f"=== SIMULATION DEBUG ===",
+            f"Render Mode: {self.render_mode}",
+            f"Filters: {'ON' if self.filters_enabled else 'OFF'}",
+            f"Debug Text: {'ON' if self.debug_text_enabled else 'OFF'}",
+            f"Replay Mode: {'ON' if replay_mode else 'OFF'}",
+            f"",
+            f"=== CONFIGURATION ===",
+            f"World Size: {WORLD_SIZE}",
+            f"Organism Count: {ORGANISM_COUNT}",
+            f"Harvest Rate: {current_harvest_rate:.4f}",
+            f"Energy Decay: {ENERGY_DECAY:.4f}",
+            f"Energy Sharing Rate: {ENERGY_SHARING_RATE}",
+            f"Reproduction Threshold: {REPRODUCTION_THRESHOLD:.4f}",
+            f"Death Threshold: {DEATH_THRESHOLD:.4f}",
+            f"",
+            f"=== SIMULATION STATE ===",
+        ]
+        
+        # Add simulation data if available
+        if simulation_data:
+            total_energy = torch.sum(simulation_data['energy']).item()
+            total_terrain = torch.sum(simulation_data['terrain']).item()
+            topology_count = torch.sum(simulation_data['topology']).item()
+            new_cells = torch.sum(simulation_data['new_cell_candidates']).item()
+            
+            lines.extend([
+                f"Total Energy: {total_energy:.2f}",
+                f"Total Terrain: {total_terrain:.2f}",
+                f"Organisms: {topology_count:.0f}",
+                f"New Cell Candidates: {new_cells:.0f}",
+            ])
+        
+        # Add CNN info if available
+        if current_best_cnn is not None:
+            lines.extend([
+                f"",
+                f"=== CNN STATE ===",
+                f"Best CNN Active: YES",
+                f"Kernel Center: {current_best_cnn.kernel.data[1, 1].item():.3f}",
+            ])
+        else:
+            lines.extend([
+                f"",
+                f"=== CNN STATE ===",
+                f"Best CNN Active: NO",
+            ])
+        
+        # Render each line
+        for i, line in enumerate(lines):
+            self.render_text(text_x, text_y + (i * line_height), line)
+        
+        # Restore OpenGL state
+        glPopAttrib()
+        glPopMatrix()
+        glMatrixMode(GL_PROJECTION)
+        glPopMatrix()
+        glMatrixMode(GL_MODELVIEW)
     
     def render(self, environment, topology, mask, new_cell_candidates=None):
         """Render the current state using PyTorch tensors directly - GPU accelerated"""
@@ -270,8 +712,8 @@ class Renderer:
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, self.world_size, self.world_size, 0, GL_RGB, GL_UNSIGNED_BYTE, image_np)
     
-    def render_opengl(self):
-        """Render using OpenGL (OpenGL 2.1 compatible)"""
+    def render_opengl(self, simulation_data=None, current_harvest_rate=0, replay_mode=False, current_best_cnn=None):
+        """Render using OpenGL (OpenGL 2.1 compatible) with debug text"""
         if not self.opengl_initialized:
             return
             
@@ -294,17 +736,21 @@ class Renderer:
         glVertex2f(-1.0, 1.0)    # Top-left
         glEnd()
         
+        # Render debug text overlay
+        self.render_debug_info(simulation_data, current_harvest_rate, replay_mode, current_best_cnn)
+        
         # Swap buffers
         glutSwapBuffers()
     
 
 class Simulation:
-    def __init__(self):
+    def __init__(self, enable_debug: bool = True):
         self.world_size = WORLD_SIZE
         self.environment = Environment(self.world_size, NOISE_SCALE, QUANTIZATION_STEP)
         self.organism_manager = OrganismManager(self.world_size, ORGANISM_COUNT, self.environment.terrain)
         self.logger = Logger()
         self.tick = 0
+        self.enable_debug = enable_debug
     
     def update_simulation(self):
         """Update one simulation tick"""
@@ -320,8 +766,8 @@ class Simulation:
         
         self.logger.update_fps()
        
-        debug_info = self.logger.get_debug_info()
-        if self.tick % DEBUG_PRINT_INTERVAL == 0:
+        if self.enable_debug and self.tick % DEBUG_PRINT_INTERVAL == 0:
+            debug_info = self.logger.get_debug_info()
             # Debug: Log total energy in system and terrain
             total_energy = torch.sum(self.organism_manager.energy_matrix).item()
             total_terrain = torch.sum(self.environment.terrain).item()
@@ -341,9 +787,38 @@ class Simulation:
             'new_cell_candidates': self.organism_manager.new_cell_candidates
         }
     
+    def reset_for_replay(self):
+        """Reset simulation for replay with new CNN"""
+        # Reset organism manager
+        self.organism_manager = OrganismManager(self.world_size, ORGANISM_COUNT, self.environment.terrain)
+        # Reset tick counter
+        self.tick = 0
+    
+
+def start_cnn_evolution(grapher: Grapher | None = None):
+    """Start CNN evolution training"""
+    print("Starting CNN Evolution Training...")
+    evolution_driver = CNNEvolutionDriver(WORLD_SIZE, epochs=CNN_TRAINING_EPOCHS, max_time=CNN_TRAINING_MAX_TIME)
+    evolution_driver.grapher = grapher
+    best_cnn = evolution_driver.run_evolution()
+    
+    print(f"\nTraining completed! Best CNN kernel:")
+    print(best_cnn.kernel.data)
+    
+    return best_cnn
+    
 
 def main():
     """Main simulation loop with GPU-accelerated OpenGL rendering"""
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--train', action='store_true', help='Run CNN training mode (no OpenGL sim)')
+    args, _ = parser.parse_known_args()
+
+    if args.train:
+        # Training mode with matplotlib graphs
+        grapher = Grapher()
+        start_cnn_evolution(grapher)
+        return
     # Initialize OpenGL/GLUT
     glut.glutInit()
     glut.glutInitDisplayMode(glut.GLUT_DOUBLE | glut.GLUT_RGB)
@@ -376,7 +851,7 @@ def main():
     # Rendering frequency - simulation runs at MAXIMUM SPEED
     rendering_fps = RENDERING_FPS
     # Calculate rendering frequency based on target FPS (simulation runs at full speed)
-    rendering_frequency = max(1, 60 // RENDERING_FPS)  # Assume 60 FPS base for calculation
+    rendering_frequency = max(1, RENDERING_BASE_FPS // RENDERING_FPS)  # Calculate rendering frequency
     
     # Frame rate control variables
     last_frame_time = time.time()
@@ -389,13 +864,13 @@ def main():
     
     def display():
         """OpenGL display callback - only handles rendering when window needs redraw"""
-        global current_renderer
+        global current_renderer, current_harvest_rate, replay_mode, current_best_cnn
         
         # Only render if we have data
         if last_sim_data is not None:
             # Update OpenGL texture and render
             current_renderer.update_texture(current_renderer.last_image)
-            current_renderer.render_opengl()
+            current_renderer.render_opengl(last_sim_data, current_harvest_rate, replay_mode, current_best_cnn)
     
     def keyboard(key, x, y):
         """OpenGL keyboard callback"""
@@ -416,6 +891,24 @@ def main():
             else:
                 current_harvest_rate = 0
                 print("Harvest rate disabled: 0")
+        elif key == b't':
+            # Start CNN training
+            print("Starting CNN evolution training...")
+            best_cnn = start_cnn_evolution()
+            # Replace current CNN with trained one
+            current_simulation.organism_manager.energy_distribution_cnn = best_cnn
+            print("CNN training completed and applied!")
+        elif key == b'r':
+            # Toggle replay mode
+            global replay_mode
+            replay_mode = not replay_mode
+            if replay_mode:
+                print("Replay mode enabled - showing best organism from last generation")
+            else:
+                print("Replay mode disabled - showing normal simulation")
+        elif key == b'd':
+            # Toggle debug text
+            current_renderer.toggle_debug_text()
     
     # Frame rate control - ONLY for rendering/OpenGL
     rendering_frame_counter = 0
@@ -426,14 +919,18 @@ def main():
     def idle():
         """OpenGL idle callback with proper frame rate limiting"""
         nonlocal rendering_frame_counter, last_sim_data, last_frame_time
-        global current_simulation, current_renderer
+        global current_simulation, current_renderer, current_best_cnn, replay_mode
         
         # Calculate time since last frame
         current_time = time.time()
         delta_time = current_time - last_frame_time
         
         # Update simulation at FULL SPEED - no frame limiting
-        last_sim_data = current_simulation.update_simulation()
+        # Use replay simulation if in replay mode and it exists
+        if replay_mode and hasattr(current_simulation, 'replay_simulation') and current_simulation.replay_simulation is not None:
+            last_sim_data = current_simulation.replay_simulation.update_simulation()
+        else:
+            last_sim_data = current_simulation.update_simulation()
         
         # Render at limited frequency using last simulation data
         rendering_frame_counter += 1
