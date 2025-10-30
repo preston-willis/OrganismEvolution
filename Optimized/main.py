@@ -42,9 +42,9 @@ class EnergyDistributionCNN(torch.nn.Module):
         self.device = device
         
         # Create 3x3 kernel for energy distribution (excluding center)
-        kernel = torch.tensor([[-12.8405, -10.0789, -13.9634],
-        [ -5.2370, -13.8395, -10.9243],
-        [ -4.8459,  -7.6581,  -6.9305]], device='mps:0')
+        kernel = torch.tensor([[ -9.0762, -10.5685, -14.5770],
+        [-12.8549, -14.4129, -13.8104],
+        [ -7.7356, -12.5784,  -9.3262]], device='mps:0')
         # kernel[1, 1] = 0  # Don't include center cell
         
         # Register as buffer for conv2d
@@ -235,6 +235,7 @@ class ParallelCNNEvaluator:
         """Evaluate a single CNN simulation"""
         total_energy = 0
         energy_history = []
+        ticks_alive = 0
         
         # Run simulation for max_time steps
         for t in range(self.max_time):
@@ -244,6 +245,7 @@ class ParallelCNNEvaluator:
             current_energy = torch.sum(simulation.organism_manager.energy_matrix).item()
             total_energy += current_energy
             energy_history.append(current_energy)
+            ticks_alive += 1
 
             # Tick graph update every 10 ticks if grapher attached
             if self.grapher is not None and t % 10 == 0:
@@ -251,18 +253,18 @@ class ParallelCNNEvaluator:
                 env_energy = torch.sum(simulation.environment.terrain).item()
                 total = org_energy + env_energy
                 # enqueue only; GUI update happens in main thread
-                self.grapher.enqueue_tick(t, self.current_generation_max_fitness, [current_energy], org_energy, env_energy, total)
+                # For fitness series, use ticks survived (t + 1)
+                self.grapher.enqueue_tick(t, self.current_generation_max_fitness, [t + 1], org_energy, env_energy, total)
                 if bot_index is not None:
-                    self.grapher.enqueue_bot_tick(bot_index, t, current_energy, org_energy, env_energy, total)
+                    # For per-bot fitness series, use ticks survived (t + 1)
+                    self.grapher.enqueue_bot_tick(bot_index, t, t + 1, org_energy, env_energy, total)
             
             # Early termination if energy drops too low
             if current_energy < CNN_FITNESS_EARLY_TERMINATION_THRESHOLD:
                 break
                 
-        # Fitness is based on total energy and energy stability
-        avg_energy = total_energy / len(energy_history) if energy_history else 0
-        
-        fitness = avg_energy
+        # Fitness is ticks survived
+        fitness = ticks_alive
         return fitness
 
 
@@ -291,6 +293,7 @@ class CNNEvolutionDriver:
         
         total_energy = 0
         energy_history = []
+        ticks_alive = 0
         
         # Run simulation for max_time steps
         for t in range(self.max_time):
@@ -300,15 +303,14 @@ class CNNEvolutionDriver:
             current_energy = torch.sum(test_sim.organism_manager.energy_matrix).item()
             total_energy += current_energy
             energy_history.append(current_energy)
+            ticks_alive += 1
             
             # Early termination if energy drops too low
             if current_energy < CNN_FITNESS_EARLY_TERMINATION_THRESHOLD:
                 break
                 
-        # Fitness is based on total energy and energy stability
-        avg_energy = total_energy / len(energy_history) if energy_history else 0
-
-        fitness = avg_energy
+        # Fitness is ticks survived
+        fitness = ticks_alive
         return fitness
     
     def create_replay_simulation(self, best_cnn):
