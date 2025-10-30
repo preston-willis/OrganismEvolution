@@ -42,9 +42,9 @@ class EnergyDistributionCNN(torch.nn.Module):
         self.device = device
         
         # Create 3x3 kernel for energy distribution (excluding center)
-        kernel = torch.tensor([[ -9.0762, -10.5685, -14.5770],
-        [-12.8549, -14.4129, -13.8104],
-        [ -7.7356, -12.5784,  -9.3262]], device='mps:0')
+        kernel = torch.tensor([[ 3.0953,  1.2129,  2.2718],
+        [ 1.1800,  1.0464, -1.7169],
+        [ 0.5134,  0.6487, -0.5821]], device='mps:0')
         # kernel[1, 1] = 0  # Don't include center cell
         
         # Register as buffer for conv2d
@@ -233,9 +233,7 @@ class ParallelCNNEvaluator:
     
     def _evaluate_single_cnn(self, simulation, bot_index: int | None = None):
         """Evaluate a single CNN simulation"""
-        total_energy = 0
-        energy_history = []
-        ticks_alive = 0
+        total_energy = 0.0
         
         # Run simulation for max_time steps
         for t in range(self.max_time):
@@ -244,8 +242,6 @@ class ParallelCNNEvaluator:
             # Calculate fitness based on total energy and stability
             current_energy = torch.sum(simulation.organism_manager.energy_matrix).item()
             total_energy += current_energy
-            energy_history.append(current_energy)
-            ticks_alive += 1
 
             # Tick graph update every 10 ticks if grapher attached
             if self.grapher is not None and t % 10 == 0:
@@ -253,18 +249,18 @@ class ParallelCNNEvaluator:
                 env_energy = torch.sum(simulation.environment.terrain).item()
                 total = org_energy + env_energy
                 # enqueue only; GUI update happens in main thread
-                # For fitness series, use ticks survived (t + 1)
-                self.grapher.enqueue_tick(t, self.current_generation_max_fitness, [t + 1], org_energy, env_energy, total)
+                # For fitness series, use cumulative fitness (total accumulated energy so far)
+                self.grapher.enqueue_tick(t, self.current_generation_max_fitness, [total_energy], org_energy, env_energy, total)
                 if bot_index is not None:
-                    # For per-bot fitness series, use ticks survived (t + 1)
-                    self.grapher.enqueue_bot_tick(bot_index, t, t + 1, org_energy, env_energy, total)
+                    # For per-bot fitness series, use cumulative fitness
+                    self.grapher.enqueue_bot_tick(bot_index, t, total_energy, org_energy, env_energy, total)
             
             # Early termination if energy drops too low
             if current_energy < CNN_FITNESS_EARLY_TERMINATION_THRESHOLD:
                 break
                 
-        # Fitness is ticks survived
-        fitness = ticks_alive
+        # Fitness is total accumulated energy over time (rewards high energy sustained longer)
+        fitness = total_energy
         return fitness
 
 
@@ -291,9 +287,7 @@ class CNNEvolutionDriver:
         test_sim = Simulation(enable_debug=False)
         test_sim.organism_manager.energy_distribution_cnn = cnn
         
-        total_energy = 0
-        energy_history = []
-        ticks_alive = 0
+        total_energy = 0.0
         
         # Run simulation for max_time steps
         for t in range(self.max_time):
@@ -302,15 +296,13 @@ class CNNEvolutionDriver:
             # Calculate fitness based on total energy and stability
             current_energy = torch.sum(test_sim.organism_manager.energy_matrix).item()
             total_energy += current_energy
-            energy_history.append(current_energy)
-            ticks_alive += 1
             
             # Early termination if energy drops too low
             if current_energy < CNN_FITNESS_EARLY_TERMINATION_THRESHOLD:
                 break
                 
-        # Fitness is ticks survived
-        fitness = ticks_alive
+        # Fitness is total accumulated energy over time
+        fitness = total_energy
         return fitness
     
     def create_replay_simulation(self, best_cnn):
@@ -402,24 +394,20 @@ class Environment:
         self.terrain = self.generate_terrain()
     
     def generate_terrain(self):
-        """Generate Perlin noise terrain"""
-        perlin_values = np.zeros((self.world_size, self.world_size))
-        for i in range(self.world_size):
-            for j in range(self.world_size):
-                # Higher frequency noise with more octaves
-                perlin_values[i, j] = pnoise2(i * self.noise_scale * NOISE_FREQUENCY_MULTIPLIER, j * self.noise_scale * NOISE_FREQUENCY_MULTIPLIER, octaves=NOISE_OCTAVES)
-        
+        """Generate 2D sine-based terrain"""
+        x = torch.arange(self.world_size, dtype=torch.float32, device=device)
+        y = torch.arange(self.world_size, dtype=torch.float32, device=device)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        freq = self.noise_scale * NOISE_FREQUENCY_MULTIPLIER * (2.0 * np.pi)
+        values = torch.sin(xx * freq) * torch.sin(yy * freq)
         # Normalize to 0-1
-        perlin_values = (perlin_values - perlin_values.min()) / (max(perlin_values.max() - perlin_values.min(), 1e-6))
-        
-        # Apply power function to create more low energy zones
-        perlin_values = np.power(perlin_values, NOISE_POWER)
-
-        perlin_values = torch.tensor(perlin_values, dtype=torch.float32, device=device)
-        dead_mask = perlin_values > 0.3
-        perlin_values = perlin_values * dead_mask    
-        # Convert to tensor
-        return torch.clamp(perlin_values, 0, 1)
+        values = (values + 1.0) * 0.5
+        # Shape distribution using power
+        values = torch.pow(values, NOISE_POWER)
+        # Apply dead mask similar to previous behavior
+        dead_mask = values > 0.3
+        values = values * dead_mask
+        return torch.clamp(values, 0, 1)
     
     def compute_environment(self, topology_matrix, harvested_energy):
         """Modify environment based on organism presence"""
@@ -472,10 +460,20 @@ class OrganismManager:
         low_energy_mask = self.energy_matrix < DEATH_THRESHOLD
         self.topology_matrix[low_energy_mask] = 0
         
-        # Apply energy decay only where topology = 1 (organisms)
+        # Apply energy decay inversely proportional to local 3x3 average energy
         # Harvest energy from terrain where topology = 1, max harvest = ENERGY_HARVEST_RATE
         harvested_energy = torch.minimum(self.terrain, torch.tensor(current_harvest_rate, device=device))
-        self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - ENERGY_DECAY) * self.topology_matrix, 0, 1)
+
+        # Compute 10x10 local average energy (including center)
+        em = self.energy_matrix.unsqueeze(0).unsqueeze(0)
+        box_kernel = torch.ones((1, 1, 10, 10), device=device) / 100.0
+        # For even kernel sizes, padding leads to +1 output dimension; slice to original size
+        local_avg_full = torch.nn.functional.conv2d(em, box_kernel, padding=5)
+        local_avg = local_avg_full[:, :, :self.world_size, :self.world_size].squeeze(0).squeeze(0)
+        # Higher local energy -> less decay; lower local energy -> more decay
+        decay_map = (ENERGY_DECAY * (1.0 - local_avg) * ENERGY_DENSITY_DECAY_MODIFIER).clamp(0, ENERGY_DECAY)
+
+        self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - decay_map) * self.topology_matrix, 0, 1)
         
         
         # Energy sharing between adjacent cells (conserving total energy)

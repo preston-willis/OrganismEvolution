@@ -1,7 +1,7 @@
 # Configuration constants for the organism simulation
 import random
 # World Configuration
-WORLD_SIZE = 500
+WORLD_SIZE = 512
 ORGANISM_COUNT = 1
 
 # Environment Configuration
@@ -13,7 +13,9 @@ NOISE_POWER = 2.2
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.01
-ENERGY_DECAY = 0.0005
+ENERGY_DECAY = 0.005
+# Coefficient for locality-based decay modulation (0 disables effect, 1 full strength)
+ENERGY_DENSITY_DECAY_MODIFIER = 2.0
 # Spawn organisms in the center of the simulation
 CENTER_X = WORLD_SIZE // 2
 CENTER_Y = WORLD_SIZE // 2
@@ -47,7 +49,7 @@ DEBUG_PRINT_INTERVAL = 10
 # CNN Training Configuration
 CNN_POPULATION_SIZE = 8
 CNN_MUTATION_RATE = 1
-CNN_MUTATION_MAGNITUDE = 2
+CNN_MUTATION_MAGNITUDE = 1
 CNN_TRAINING_EPOCHS = 100
 CNN_TRAINING_MAX_TIME = 1000
 CNN_DEFAULT_EPOCHS = 1000
