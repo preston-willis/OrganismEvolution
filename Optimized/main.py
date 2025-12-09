@@ -511,8 +511,18 @@ class OrganismManager:
         # Harvest energy from terrain
         harvested_energy = torch.minimum(self.terrain, torch.tensor(ENERGY_HARVEST_RATE, device=device))
 
-        # Apply decay and harvest
+
+#  # Compute 3x3 neighborhood energy sum for each cell
+#         neighborhood_kernel = torch.ones((1, 1, 3, 3), device=device)
+#         neighborhood_energy = torch.nn.functional.conv2d(
+#             self.energy_matrix.unsqueeze(0).unsqueeze(0),
+#             neighborhood_kernel,
+#             padding=1
+#         ).squeeze(0).squeeze(0)
+
+        # Apply decay and harvest, multiplied by neighborhood energy factor
         self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - ENERGY_DECAY) * self.topology_matrix, 0, 1)
+
         return harvested_energy
     
     def _compute_energy_contributions(self, shareable_energy, proportions):
@@ -662,6 +672,7 @@ class OrganismManager:
 class Renderer:
     def __init__(self, world_size):
         self.world_size = world_size
+        self.render_size = int(world_size * PIXEL_SCALE_FACTOR)
         self.render_mode = "org_energy"  # "org_top" or "org_energy"
         self.filters_enabled = True  # True = show organisms, False = environment only
         self.texture_id = None
@@ -712,8 +723,8 @@ class Renderer:
         glPushAttrib(GL_ALL_ATTRIB_BITS)
         
         # Set viewport for debug text (full window)
-        window_width = self.world_size + self.left_margin + self.right_margin
-        window_height = self.world_size + self.top_margin + self.bottom_margin
+        window_width = self.render_size + self.left_margin + self.right_margin
+        window_height = self.render_size + self.top_margin + self.bottom_margin
         glViewport(0, 0, window_width, window_height)
         
         glMatrixMode(GL_PROJECTION)
@@ -866,6 +877,10 @@ class Renderer:
         if image_tensor.device.type != 'cuda' and image_tensor.device.type != 'mps':
             image_tensor = image_tensor.to(device)
         
+        # Upscale image tensor by sampling each pixel d times in each dimension
+        if PIXEL_SCALE_FACTOR > 1:
+            image_tensor = image_tensor.repeat_interleave(PIXEL_SCALE_FACTOR, dim=1).repeat_interleave(PIXEL_SCALE_FACTOR, dim=2)
+        
         # Process entirely on GPU: clamp, scale, permute, convert to uint8
         image_tensor = image_tensor.clamp(0, 1) * PIXEL_SCALE
         image_tensor = image_tensor.permute(1, 2, 0)  # CHW -> HWC
@@ -877,7 +892,7 @@ class Renderer:
         
         # Update OpenGL texture
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, self.world_size, self.world_size, 0, GL_RGB, GL_UNSIGNED_BYTE, image_np)
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, self.render_size, self.render_size, 0, GL_RGB, GL_UNSIGNED_BYTE, image_np)
     
     def render_opengl(self, simulation_data=None, current_harvest_rate=0, replay_mode=False, current_best_cnn=None, logger=None):
         """Render using OpenGL (OpenGL 2.1 compatible) with debug text"""
@@ -890,11 +905,11 @@ class Renderer:
         # Set viewport for world rendering (offset by margins)
         # OpenGL viewport Y is measured from bottom-left corner
         # Position world so its top edge aligns with debug text (top_margin from top)
-        window_height = self.world_size + self.top_margin + self.bottom_margin
-        # To have top_margin at top: viewport_y = window_height - top_margin - world_size
+        window_height = self.render_size + self.top_margin + self.bottom_margin
+        # To have top_margin at top: viewport_y = window_height - top_margin - render_size
         # This positions the world's top edge at top_margin from the window top
-        viewport_y = window_height - self.top_margin - self.world_size
-        glViewport(self.left_margin, viewport_y, self.world_size, self.world_size)
+        viewport_y = window_height - self.top_margin - self.render_size
+        glViewport(self.left_margin, viewport_y, self.render_size, self.render_size)
         
         # Ensure correct matrix mode for world rendering
         glMatrixMode(GL_PROJECTION)
@@ -1068,8 +1083,9 @@ def main():
     top_margin = 10
     bottom_margin = 10
     right_margin = 10
-    window_width = WORLD_SIZE + left_margin + right_margin
-    window_height = WORLD_SIZE + top_margin + bottom_margin
+    render_size = int(WORLD_SIZE * PIXEL_SCALE_FACTOR)
+    window_width = render_size + left_margin + right_margin
+    window_height = render_size + top_margin + bottom_margin
     glut.glutInitWindowSize(window_width, window_height)
     glut.glutCreateWindow(b"Organism Simulation - OpenGL GPU Accelerated")
     

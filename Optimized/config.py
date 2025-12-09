@@ -24,7 +24,7 @@ ORGANISM_POSITIONS = [(CENTER_X, CENTER_Y) for i in range(ORGANISM_COUNT)]
 
 # Reproduction Configuration
 REPRODUCTION_THRESHOLD = 0.01
-DEATH_THRESHOLD = 0.005
+DEATH_THRESHOLD = 0.01
 
 # Energy Configuration
 ENERGY_SHARING_RATE = 0.5
@@ -37,6 +37,7 @@ STARTING_POSITION_TERRAIN_BOOST = 10.0
 RENDERING_FPS = 30   # Desired rendering FPS
 RENDERING_BASE_FPS = 60  # Base FPS for frequency calculation
 PIXEL_SCALE = 255
+PIXEL_SCALE_FACTOR = int(WORLD_SIZE/32*20) # Factor to upscale pixels in OpenGL rendering
 
 # OpenGL Configuration
 OPENGL_CLEAR_COLOR_R = 0.0
