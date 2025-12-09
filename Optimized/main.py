@@ -530,11 +530,22 @@ class OrganismManager:
         
         # Harvest energy from terrain
         harvested_energy = torch.minimum(self.terrain, torch.tensor(ENERGY_HARVEST_RATE, device=device))
+        
+        # Compute 3x3 neighborhood energy gradient for each cell using Sobel operators
+        # Higher gradient = more unstable neighborhood = more decay
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+        
+        energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0)
+        gradient_x = torch.nn.functional.conv2d(energy_unsqueezed, sobel_x, padding=1).squeeze(0).squeeze(0)
+        gradient_y = torch.nn.functional.conv2d(energy_unsqueezed, sobel_y, padding=1).squeeze(0).squeeze(0)
+        neighborhood_gradient = torch.sqrt(gradient_x ** 2 + gradient_y ** 2)
 
-        # Apply decay with factor proportional to cell's distribution rate (sharing_rate_matrix)
-        # Higher sharing rate means decay is multiplied by that rate
-        decay_factor = self.sharing_rate_matrix * self.topology_matrix + (1 - self.topology_matrix)
-        decay_amount = ENERGY_DECAY * decay_factor
+        # Apply decay with factor proportional to cell's distribution rate and neighborhood gradient
+        # Higher sharing rate and higher gradient (more unstable) = more decay
+        neighborhood_gradient = torch.sigmoid(neighborhood_gradient)
+        decay_amount = self.sharing_rate_matrix * neighborhood_gradient * self.topology_matrix + (1 - self.topology_matrix)
+        decay_amount = torch.sigmoid(decay_amount) * ENERGY_DECAY * 10 + ENERGY_DECAY/10
         
         # Apply decay and harvest
         self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - decay_amount) * self.topology_matrix, 0, 1)
@@ -608,6 +619,8 @@ class OrganismManager:
         
         # Get 3x3 proportions and sharing_rate output from CNN
         proportions, sharing_rate_output = self.energy_distribution_cnn(shareable_energy, self.sharing_rate_matrix)
+
+        sharing_rate_output = torch.clamp(sharing_rate_output, 0.1, 0.9)
         
         # Update sharing_rate_matrix with CNN output (only for cells that exist)
         self.sharing_rate_matrix = self.sharing_rate_matrix * (1 - self.topology_matrix) + sharing_rate_output * self.topology_matrix
@@ -828,7 +841,7 @@ class Renderer:
         glPopMatrix()
         glMatrixMode(GL_MODELVIEW)
     
-    def render(self, environment, topology, mask, new_cell_candidates=None):
+    def render(self, environment, topology, mask, new_cell_candidates=None, sharing_rate=None):
         """Render the current state using PyTorch tensors directly - GPU accelerated"""
         env_scaled = environment.clamp(0, 1)
         
@@ -849,10 +862,14 @@ class Renderer:
                 image[1] = topology * 0.0 + (1 - topology) * env_scaled
                 image[2] = topology * 0.0 + (1 - topology) * env_scaled
             else:
-                # Green energy
-                image[0] = topology * 0.0 + (1 - topology) * env_scaled
+                # Red channel shows sharing rate, green shows energy
+                if sharing_rate is not None:
+                    sharing_rate_clamped = sharing_rate.clamp(0, 1)
+                    image[0] = topology * 1/sharing_rate_clamped*mask + (1 - topology) * env_scaled
+                else:
+                    image[0] = topology * mask + (1 - topology) * env_scaled
                 image[1] = topology * mask + (1 - topology) * env_scaled
-                image[2] = topology * 0.0 + (1 - topology) * env_scaled
+                image[2] = topology * mask + (1 - topology) * env_scaled
             
             # Render new cell candidates as blue
             if new_cell_candidates is not None:
@@ -1001,7 +1018,8 @@ class Simulation:
             'terrain': self.environment.terrain,
             'topology': self.organism_manager.topology_matrix,
             'energy': self.organism_manager.energy_matrix,
-            'new_cell_candidates': self.organism_manager.new_cell_candidates
+            'new_cell_candidates': self.organism_manager.new_cell_candidates,
+            'sharing_rate': self.organism_manager.sharing_rate_matrix
         }
     
     def reset_for_replay(self):
@@ -1228,7 +1246,8 @@ def main():
                 last_sim_data['terrain'], 
                 last_sim_data['topology'], 
                 mask,
-                last_sim_data['new_cell_candidates']
+                last_sim_data['new_cell_candidates'],
+                last_sim_data.get('sharing_rate', None)
             )
             
             # Store the rendered image for display() to use

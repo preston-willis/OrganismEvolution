@@ -12,8 +12,8 @@ NOISE_OCTAVES = 6
 NOISE_POWER = 2
 
 # Organism Configuration
-ENERGY_HARVEST_RATE = 0.01
-ENERGY_DECAY = 0.005
+ENERGY_HARVEST_RATE = 0.1
+ENERGY_DECAY = 0.0005
 # Coefficient for locality-based decay modulation (0 disables effect, 1 full strength)
 ENERGY_DENSITY_DECAY_MODIFIER = 0.0
 # Spawn organism at sine terrain peak by default
@@ -24,10 +24,10 @@ ORGANISM_POSITIONS = [(CENTER_X, CENTER_Y) for i in range(ORGANISM_COUNT)]
 
 # Reproduction Configuration
 REPRODUCTION_THRESHOLD = 0.01
-DEATH_THRESHOLD = 0.01
+DEATH_THRESHOLD = 0.0001
 
 # Energy Configuration
-ENERGY_SHARING_RATE = 0.5
+ENERGY_SHARING_RATE = 1
 
 # Terrain energy at the organism's starting position
 STARTING_POSITION_TERRAIN_BOOST = 10.0
