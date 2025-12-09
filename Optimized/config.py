@@ -1,7 +1,7 @@
 # Configuration constants for the organism simulation
 import random
 # World Configuration
-WORLD_SIZE = 32
+WORLD_SIZE = 64
 ORGANISM_COUNT = 1
 
 # Environment Configuration
@@ -37,7 +37,7 @@ STARTING_POSITION_TERRAIN_BOOST = 10.0
 RENDERING_FPS = 30   # Desired rendering FPS
 RENDERING_BASE_FPS = 60  # Base FPS for frequency calculation
 PIXEL_SCALE = 255
-PIXEL_SCALE_FACTOR = int(WORLD_SIZE/32*20) # Factor to upscale pixels in OpenGL rendering
+PIXEL_SCALE_FACTOR = int(32/WORLD_SIZE*20) # Factor to upscale pixels in OpenGL rendering
 
 # OpenGL Configuration
 OPENGL_CLEAR_COLOR_R = 0.0

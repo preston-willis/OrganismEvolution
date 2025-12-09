@@ -42,10 +42,10 @@ class EnergyDistributionCNN(torch.nn.Module):
         super().__init__()
         self.device = device
         # Conv layers for processing perception vectors
-        # Input: 3 channels (from perceive: 3*channel_n where channel_n=1)
-        # Output: 9 channels (3x3 distribution matrix)
-        self.conv1 = torch.nn.Conv2d(3, 128, kernel_size=3, padding=1, device=device)
-        self.conv2 = torch.nn.Conv2d(128, 9, kernel_size=1, device=device) 
+        # Input: 6 channels (from perceive: 3*channel_n where channel_n=2 for shareable_energy + sharing_rate)
+        # Output: 10 channels (9 for 3x3 distribution matrix + 1 for sharing_rate)
+        self.conv1 = torch.nn.Conv2d(6, 128, kernel_size=3, padding=1, device=device)
+        self.conv2 = torch.nn.Conv2d(128, 10, kernel_size=1, device=device) 
         # Move model to device
         self.to(device)
 
@@ -93,25 +93,39 @@ class EnergyDistributionCNN(torch.nn.Module):
         
         return y
         
-    def forward(self, shareable_energy):
+    def forward(self, shareable_energy, sharing_rate):
         """
-        Input: shareable_energy of shape (world_size, world_size)
-        Output: proportions of shape (3, 3, world_size, world_size)
-               Each (i, j) position has a 3x3 matrix showing how to distribute energy to neighbors
+        Input: 
+            shareable_energy of shape (world_size, world_size)
+            sharing_rate of shape (world_size, world_size)
+        Output: 
+            proportions of shape (3, 3, world_size, world_size)
+            sharing_rate_output of shape (world_size, world_size)
         """
         shareable_energy = shareable_energy.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-        perception_vector = self.perceive(shareable_energy)  # (B, 3*C, H, W)
+        sharing_rate = sharing_rate.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        
+        # Stack channels: (1, 2, H, W)
+        input_channels = torch.cat([shareable_energy, sharing_rate], dim=1)
+        perception_vector = self.perceive(input_channels)  # (B, 6, H, W)
 
         x = self.conv1(perception_vector)
         x = torch.nn.functional.relu(x)
-        x = self.conv2(x)
+        x = self.conv2(x)  # (B, 10, H, W)
         
-        proportions_flat = torch.nn.functional.softmax(x, dim=1)  # (B, 9, H, W)
+        # Split output: 9 channels for proportions, 1 channel for sharing_rate
+        proportions_flat = x[:, :9, :, :]  # (B, 9, H, W)
+        sharing_rate_output = x[:, 9:10, :, :].squeeze(0).squeeze(0)  # (H, W)
+        
+        proportions_flat = torch.nn.functional.softmax(proportions_flat, dim=1)  # (B, 9, H, W)
         
         # Reshape to (3, 3, H, W) - each cell has its 3x3 distribution matrix
         proportions = proportions_flat.squeeze(0).view(3, 3, WORLD_SIZE, WORLD_SIZE)  # (3, 3, H, W)
         
-        return proportions
+        # Clamp sharing_rate_output to valid range
+        sharing_rate_output = torch.sigmoid(sharing_rate_output)  # (H, W)
+        
+        return proportions, sharing_rate_output
 
 
 class CNNGeneticAlgorithm:
@@ -471,6 +485,7 @@ class OrganismManager:
         self.positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
         self.topology_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
         self.energy_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
+        self.sharing_rate_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
         self.new_cell_candidates = torch.zeros((world_size, world_size), dtype=torch.bool, device=device)
         self._initialize_topology()
         
@@ -486,6 +501,7 @@ class OrganismManager:
             y_coords, x_coords = self.positions[:, 1], self.positions[:, 0]
             self.topology_matrix[y_coords, x_coords] = 1
             self.energy_matrix[y_coords, x_coords] = 1
+            self.sharing_rate_matrix[y_coords, x_coords] = ENERGY_SHARING_RATE
     
     def compute_topology(self):
         """Reproduce using new_cell_candidates mask from energy sharing"""
@@ -498,6 +514,9 @@ class OrganismManager:
         
         # Add selected positions to topology
         self.topology_matrix[energy_mask] = 1
+        
+        # Initialize sharing_rate for new cells
+        self.sharing_rate_matrix[energy_mask] = ENERGY_SHARING_RATE
     
     def _apply_harvest_and_decay(self, terrain):
         """Harvest energy from terrain and apply decay"""
@@ -507,21 +526,18 @@ class OrganismManager:
         # Remove organisms with energy below threshold
         low_energy_mask = self.energy_matrix < DEATH_THRESHOLD
         self.topology_matrix[low_energy_mask] = 0
+        self.sharing_rate_matrix[low_energy_mask] = 0
         
         # Harvest energy from terrain
         harvested_energy = torch.minimum(self.terrain, torch.tensor(ENERGY_HARVEST_RATE, device=device))
 
-
-#  # Compute 3x3 neighborhood energy sum for each cell
-#         neighborhood_kernel = torch.ones((1, 1, 3, 3), device=device)
-#         neighborhood_energy = torch.nn.functional.conv2d(
-#             self.energy_matrix.unsqueeze(0).unsqueeze(0),
-#             neighborhood_kernel,
-#             padding=1
-#         ).squeeze(0).squeeze(0)
-
-        # Apply decay and harvest, multiplied by neighborhood energy factor
-        self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - ENERGY_DECAY) * self.topology_matrix, 0, 1)
+        # Apply decay with factor proportional to cell's distribution rate (sharing_rate_matrix)
+        # Higher sharing rate means decay is multiplied by that rate
+        decay_factor = self.sharing_rate_matrix * self.topology_matrix + (1 - self.topology_matrix)
+        decay_amount = ENERGY_DECAY * decay_factor
+        
+        # Apply decay and harvest
+        self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - decay_amount) * self.topology_matrix, 0, 1)
 
         return harvested_energy
     
@@ -587,11 +603,14 @@ class OrganismManager:
         # Preserve source energy for reads (avoid race conditions)
         source_energy = self.energy_matrix.clone()
         
-        # Calculate shareable energy (only organisms can share)
-        shareable_energy = source_energy * self.topology_matrix * ENERGY_SHARING_RATE
+        # Calculate shareable energy using per-cell sharing rates (only organisms can share)
+        shareable_energy = source_energy * self.topology_matrix * self.sharing_rate_matrix
         
-        # Get 3x3 proportions from CNN
-        proportions = self.energy_distribution_cnn(shareable_energy)
+        # Get 3x3 proportions and sharing_rate output from CNN
+        proportions, sharing_rate_output = self.energy_distribution_cnn(shareable_energy, self.sharing_rate_matrix)
+        
+        # Update sharing_rate_matrix with CNN output (only for cells that exist)
+        self.sharing_rate_matrix = self.sharing_rate_matrix * (1 - self.topology_matrix) + sharing_rate_output * self.topology_matrix
         
         # Compute contributions
         contributions = self._compute_energy_contributions(shareable_energy, proportions)
