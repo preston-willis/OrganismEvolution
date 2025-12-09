@@ -46,14 +46,14 @@ class Grapher:
         self.bot_tick_total_energy.clear()
         # Clear tick axes immediately for visual reset
         self.ax_tick_perbot_fit.clear()
-        self.ax_tick_perbot_fit.set_title('Per-bot Fitness (every 10 ticks)')
+        self.ax_tick_perbot_fit.set_title('Per-bot Fitness (Cell Count, every 10 ticks)')
         self.ax_tick_perbot_fit.set_xlabel('Tick')
-        self.ax_tick_perbot_fit.set_ylabel('Fitness')
+        self.ax_tick_perbot_fit.set_ylabel('Cumulative Cell Count')
         
         self.ax_org_energy.clear()
-        self.ax_org_energy.set_title('Organism Energy (every 10 ticks)')
+        self.ax_org_energy.set_title('Cell Count (every 10 ticks)')
         self.ax_org_energy.set_xlabel('Tick')
-        self.ax_org_energy.set_ylabel('Energy')
+        self.ax_org_energy.set_ylabel('Cell Count')
         
         self.ax_env_energy.clear()
         self.ax_env_energy.set_title('Environment Energy (every 10 ticks)')
@@ -98,7 +98,7 @@ class Grapher:
             self.ax_gen.clear()
             self.ax_gen.set_title(f'Generation {gen_index}')
             self.ax_gen.set_xlabel('Generation')
-            self.ax_gen.set_ylabel('Best Fitness')
+            self.ax_gen.set_ylabel('Best Fitness (Cell Count)')
             self.ax_gen.plot(range(len(self.gen_history)), self.gen_history, marker='o')
             gen_updated = True
 
@@ -141,9 +141,9 @@ class Grapher:
             # Each metric on its own axis in the same window
             # Per-bot fitness (tick-based) colored (top-right)
             self.ax_tick_perbot_fit.clear()
-            self.ax_tick_perbot_fit.set_title('Per-bot Fitness (every 10 ticks)')
+            self.ax_tick_perbot_fit.set_title('Per-bot Fitness (Cell Count, every 10 ticks)')
             self.ax_tick_perbot_fit.set_xlabel('Tick')
-            self.ax_tick_perbot_fit.set_ylabel('Fitness')
+            self.ax_tick_perbot_fit.set_ylabel('Cumulative Cell Count')
             for idx, (ticks, vals) in self.bot_tick_fitness.items():
                 self.ax_tick_perbot_fit.plot(ticks, vals, label=f'Bot {idx}')
             # if self.bot_tick_fitness:
@@ -151,9 +151,9 @@ class Grapher:
 
             # Per-bot organism energy colored
             self.ax_org_energy.clear()
-            self.ax_org_energy.set_title('Per-bot Organism Energy (every 10 ticks)')
+            self.ax_org_energy.set_title('Per-bot Cell Count (every 10 ticks)')
             self.ax_org_energy.set_xlabel('Tick')
-            self.ax_org_energy.set_ylabel('Energy')
+            self.ax_org_energy.set_ylabel('Cell Count')
             for idx, (ticks, vals) in self.bot_tick_org_energy.items():
                 self.ax_org_energy.plot(ticks, vals, label=f'Bot {idx}')
             # if self.bot_tick_org_energy:

@@ -1,32 +1,36 @@
 # Configuration constants for the organism simulation
 import random
 # World Configuration
-WORLD_SIZE = 512
+WORLD_SIZE = 32
 ORGANISM_COUNT = 1
 
 # Environment Configuration
 NOISE_SCALE = 0.01
 QUANTIZATION_STEP = 0.01
-NOISE_FREQUENCY_MULTIPLIER = 3
+NOISE_FREQUENCY_MULTIPLIER = 4
 NOISE_OCTAVES = 6
-NOISE_POWER = 2.2
+NOISE_POWER = 2
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.01
 ENERGY_DECAY = 0.005
 # Coefficient for locality-based decay modulation (0 disables effect, 1 full strength)
-ENERGY_DENSITY_DECAY_MODIFIER = 2.0
-# Spawn organisms in the center of the simulation
+ENERGY_DENSITY_DECAY_MODIFIER = 0.0
+# Spawn organism at sine terrain peak by default
+# For default NOISE_SCALE = 0.01, NOISE_FREQUENCY_MULTIPLIER = 3, peaks are at multiples of about 8
 CENTER_X = WORLD_SIZE // 2
 CENTER_Y = WORLD_SIZE // 2
 ORGANISM_POSITIONS = [(CENTER_X, CENTER_Y) for i in range(ORGANISM_COUNT)]
 
 # Reproduction Configuration
-REPRODUCTION_THRESHOLD = 0.005
-DEATH_THRESHOLD = 0.001
+REPRODUCTION_THRESHOLD = 0.01
+DEATH_THRESHOLD = 0.005
 
 # Energy Configuration
-ENERGY_SHARING_RATE = 1
+ENERGY_SHARING_RATE = 0.5
+
+# Terrain energy at the organism's starting position
+STARTING_POSITION_TERRAIN_BOOST = 10.0
 
 
 # Rendering Configuration
@@ -51,9 +55,5 @@ CNN_POPULATION_SIZE = 8
 CNN_MUTATION_RATE = 1
 CNN_MUTATION_MAGNITUDE = 1
 CNN_TRAINING_EPOCHS = 100
-CNN_TRAINING_MAX_TIME = 1000
-CNN_DEFAULT_EPOCHS = 1000
-CNN_DEFAULT_MAX_TIME = 1000
-CNN_FITNESS_EARLY_TERMINATION_THRESHOLD = 0.001
-CNN_STABILITY_VARIANCE_THRESHOLD = 100.0
-CNN_ENERGY_HISTORY_WINDOW = 100
+CNN_TRAINING_MAX_TIME = 100
+CNN_FITNESS_EARLY_TERMINATION_THRESHOLD = 0.1

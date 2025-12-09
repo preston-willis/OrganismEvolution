@@ -14,7 +14,8 @@ from OpenGL.GL import glRasterPos2f, glCallLists
 import ctypes
 import uuid
 import random
-from concurrent.futures import ThreadPoolExecutor
+import os
+import glob
 
 # Import our modules
 from config import *
@@ -36,53 +37,85 @@ current_best_cnn = None
 replay_mode = False
 
 class EnergyDistributionCNN(torch.nn.Module):
-    """CNN that distributes energy across the entire world grid using 3x3 convolution"""
+    """CNN that outputs 3x3 distribution proportions for each source cell"""
     def __init__(self, device):
         super().__init__()
         self.device = device
-        
-        # Create 3x3 kernel for energy distribution (excluding center)
-        kernel = torch.tensor([[ 3.0953,  1.2129,  2.2718],
-        [ 1.1800,  1.0464, -1.7169],
-        [ 0.5134,  0.6487, -0.5821]], device='mps:0')
-        # kernel[1, 1] = 0  # Don't include center cell
-        
-        # Register as buffer for conv2d
-        self.register_buffer('kernel', kernel)
-        
+        # Conv layers for processing perception vectors
+        # Input: 3 channels (from perceive: 3*channel_n where channel_n=1)
+        # Output: 9 channels (3x3 distribution matrix)
+        self.conv1 = torch.nn.Conv2d(3, 128, kernel_size=3, padding=1, device=device)
+        self.conv2 = torch.nn.Conv2d(128, 9, kernel_size=1, device=device) 
         # Move model to device
         self.to(device)
+
+    def perceive(self, x, angle=0.0):
+        
+        channel_n = x.shape[1]
+        
+        # Identity kernel: [0, 1, 0] outer product
+        identify = torch.tensor([0.0, 1.0, 0.0], device=x.device, dtype=x.dtype)
+        identify = torch.outer(identify, identify)
+        
+        # Sobel filter for dx
+        dx = torch.outer(
+            torch.tensor([1.0, 2.0, 1.0], device=x.device, dtype=x.dtype),
+            torch.tensor([-1.0, 0.0, 1.0], device=x.device, dtype=x.dtype)
+        ) / 8.0
+        dy = dx.T
+        
+        # Rotation
+        c = torch.cos(torch.tensor(angle, device=x.device, dtype=x.dtype))
+        s = torch.sin(torch.tensor(angle, device=x.device, dtype=x.dtype))
+        
+        # Stack kernels: [identity, rotated_dx, rotated_dy]
+        kernel = torch.stack([
+            identify,
+            c * dx - s * dy,
+            s * dx + c * dy
+        ], dim=-1)  # (3, 3, 3)
+        
+        # Add channel dimension: (3, 3, 1, 3)
+        kernel = kernel.unsqueeze(2)
+        
+        # Repeat for each input channel: (3, 3, channel_n, 3)
+        kernel = kernel.repeat(1, 1, channel_n, 1)
+        
+        # Reshape for depthwise conv2d: (out_channels=3*channel_n, in_channels=1, 3, 3)
+        # For depthwise, we need (out_channels, in_channels/groups, H, W) where groups=channel_n
+        # So we reshape to (3*channel_n, 1, 3, 3)
+        kernel = kernel.permute(3, 2, 0, 1)  # (3, channel_n, 3, 3)
+        kernel = kernel.reshape(3 * channel_n, 1, 3, 3)
+        
+        # Depthwise convolution: groups=channel_n means each input channel gets its own filter
+        # Output will have 3*channel_n channels (3 perception channels per input channel)
+        y = torch.nn.functional.conv2d(x, kernel, padding=1, stride=1, groups=channel_n)
+        
+        return y
         
     def forward(self, shareable_energy):
         """
         Input: shareable_energy of shape (world_size, world_size)
-        Output: distributed energies of shape (world_size, world_size)
+        Output: proportions of shape (3, 3, world_size, world_size)
+               Each (i, j) position has a 3x3 matrix showing how to distribute energy to neighbors
         """
-        # Prepare input with batch/channel dims
-        x = shareable_energy.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        shareable_energy = shareable_energy.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+        perception_vector = self.perceive(shareable_energy)  # (B, 3*C, H, W)
 
-        # Convolution using the stored kernel
-        out = torch.nn.functional.conv2d(x, self.kernel.unsqueeze(0).unsqueeze(0), padding=1)
-
-        # Softmax each 3x3 locality on the OUTPUT (destination gets a per-source 3x3 distribution)
-        patches_out = torch.nn.functional.unfold(out, kernel_size=3, padding=1)  # (1, 9, H*W)
-        local_probs = torch.nn.functional.softmax(patches_out, dim=1)            # (1, 9, H*W)
-        center_idx = 4
-        H, W = out.shape[-2:]
-
-        # Source-only gating and scaling: use the input shareable center per source
-        patches_in = torch.nn.functional.unfold(x, kernel_size=3, padding=1)     # (1, 9, H*W)
-        center_energy = patches_in[:, center_idx:center_idx+1, :]                # (1,1,H*W)
-        gated_weighted = local_probs * center_energy                              # (1,9,H*W)
-
-        # Fold back to accumulate contributions from all sources into destinations
-        distributed = torch.nn.functional.fold(gated_weighted, output_size=(H, W), kernel_size=3, padding=1)  # (1,1,H,W)
-
-        return distributed.squeeze(0).squeeze(0)
+        x = self.conv1(perception_vector)
+        x = torch.nn.functional.relu(x)
+        x = self.conv2(x)
+        
+        proportions_flat = torch.nn.functional.softmax(x, dim=1)  # (B, 9, H, W)
+        
+        # Reshape to (3, 3, H, W) - each cell has its 3x3 distribution matrix
+        proportions = proportions_flat.squeeze(0).view(3, 3, WORLD_SIZE, WORLD_SIZE)  # (3, 3, H, W)
+        
+        return proportions
 
 
 class CNNGeneticAlgorithm:
-    """Genetic algorithm for training CNN weights with parallel GPU evaluation"""
+    """Genetic algorithm for training CNN weights with GPU evaluation"""
     def __init__(self, pop_size, mut_rate, mut_mag, device):
         self.pop_size = pop_size
         self.mut_rate = mut_rate
@@ -94,9 +127,6 @@ class CNNGeneticAlgorithm:
         # Initialize population of CNNs
         self.subjects = [EnergyDistributionCNN(device) for _ in range(pop_size)]
         self.fitness_scores = [0.0] * pop_size
-        
-        # Create batched kernel for parallel evaluation
-        self.batched_kernels = torch.stack([cnn.kernel for cnn in self.subjects])  # (pop_size, 3, 3)
         
     def reset_fitness(self):
         """Reset all fitness scores"""
@@ -124,42 +154,48 @@ class CNNGeneticAlgorithm:
                 best_index = i
         self.fittest_index = best_index
         
-    def update_batched_kernels(self):
-        """Update the batched kernels from individual CNNs"""
-        self.batched_kernels = torch.stack([cnn.kernel for cnn in self.subjects])
-        
     def crossover(self, parent):
         """Copy parent weights to all subjects"""
         for i in range(self.pop_size):
             if i != self.fittest_index:  # Don't overwrite the parent
-                # Copy kernel weights
-                self.subjects[i].kernel.data = parent.kernel.data.clone()
-        
-        # Update batched kernels
-        self.update_batched_kernels()
+                # Copy conv layer parameters
+                self.subjects[i].conv1.weight.data = parent.conv1.weight.data.clone()
+                self.subjects[i].conv1.bias.data = parent.conv1.bias.data.clone()
+                self.subjects[i].conv2.weight.data = parent.conv2.weight.data.clone()
+                self.subjects[i].conv2.bias.data = parent.conv2.bias.data.clone()
                 
     def mutate(self):
         """Apply mutations to all subjects except the fittest"""
         for i in range(self.pop_size):
-            if i != self.fittest_index:  # Don't mutate the fittest
-                # Create mutation mask
-                mutation_mask = torch.rand_like(self.subjects[i].kernel) < self.mut_rate
+            if i == self.fittest_index:  # Don't mutate the fittest
+                continue
+            
+            # Mutate conv1 parameters
+            mutation_mask = torch.rand_like(self.subjects[i].conv1.weight) < self.mut_rate
+            mutations = (torch.rand_like(self.subjects[i].conv1.weight) - 0.5) * 2 * self.mut_mag
+            self.subjects[i].conv1.weight.data[mutation_mask] += mutations[mutation_mask]
+            
+            mutation_mask = torch.rand_like(self.subjects[i].conv1.bias) < self.mut_rate
+            mutations = (torch.rand_like(self.subjects[i].conv1.bias) - 0.5) * 2 * self.mut_mag
+            self.subjects[i].conv1.bias.data[mutation_mask] += mutations[mutation_mask]
+            
+            # Mutate conv2 parameters
+            mutation_mask = torch.rand_like(self.subjects[i].conv2.weight) < self.mut_rate
+            mutations = (torch.rand_like(self.subjects[i].conv2.weight) - 0.5) * 2 * self.mut_mag
+            self.subjects[i].conv2.weight.data[mutation_mask] += mutations[mutation_mask]
+            
+            mutation_mask = torch.rand_like(self.subjects[i].conv2.bias) < self.mut_rate
+            mutations = (torch.rand_like(self.subjects[i].conv2.bias) - 0.5) * 2 * self.mut_mag
+            self.subjects[i].conv2.bias.data[mutation_mask] += mutations[mutation_mask]
                 
-                # Generate random mutations
-                mutations = (torch.rand_like(self.subjects[i].kernel) - 0.5) * 2 * self.mut_mag
-                
-                # Apply mutations
-                self.subjects[i].kernel.data[mutation_mask] += mutations[mutation_mask]
-                
-                # # Ensure center remains 0 (no self-connection)
-                # self.subjects[i].kernel.data[1, 1] = 0
-        
-        # Update batched kernels
-        self.update_batched_kernels()
-                
-    def save_model(self, index):
+    def save_model(self, index, generation=None):
         """Save model weights to file"""
-        filename = f'data/cnn_{self.run_id}_{self.fitness_scores[index]:.6f}.pt'
+        if generation is not None:
+            filename = f'data/cnn_{self.run_id}_gen{generation}_{self.fitness_scores[index]:.6f}.pt'
+        else:
+            filename = f'data/cnn_{self.run_id}_{self.fitness_scores[index]:.6f}.pt'
+        # Ensure data directory exists
+        os.makedirs('data', exist_ok=True)
         torch.save(self.subjects[index].state_dict(), filename)
         print(f"Saved model: {filename}")
         
@@ -171,10 +207,28 @@ class CNNGeneticAlgorithm:
             print(f"Loaded model: {filename}")
         except Exception as e:
             print(f"Couldn't load {filename}: {e}")
+    
+    def load_latest_model(self):
+        """Load the fittest model from the last generation of the last run"""
+        # Find all .pt files in data directory
+        pattern = 'data/cnn_*_gen*_*.pt'
+        files = glob.glob(pattern)
+        
+        if not files:
+            print("No saved models found in data/ directory")
+            return False
+        
+        # Sort by modification time (newest first)
+        files.sort(key=os.path.getmtime, reverse=True)
+        
+        # Get the most recent file
+        latest_file = files[0]
+        self.load_model(latest_file)
+        return True
 
 
-class ParallelCNNEvaluator:
-    """Parallel CNN evaluator for GPU-accelerated fitness computation"""
+class CNNEvaluator:
+    """CNN evaluator for GPU-accelerated fitness computation"""
     def __init__(self, world_size, max_time, device):
         self.world_size = world_size
         self.max_time = max_time
@@ -182,91 +236,66 @@ class ParallelCNNEvaluator:
         self.grapher = None
         self.current_generation_max_fitness = 0.0
         
-    def evaluate_population_parallel(self, batched_kernels, pop_size):
-        """Evaluate entire population in parallel on GPU using threading"""
-        
-        # Create simulation instances for each CNN (debug disabled during training)
-        simulations = []
-        for i in range(pop_size):
-            sim = Simulation(enable_debug=False)
-            # Replace the CNN with a custom one using the batched kernel
-            sim.organism_manager.energy_distribution_cnn = self._create_cnn_from_kernel(batched_kernels[i])
-            simulations.append(sim)
-        
-        # Run simulations in parallel using ThreadPoolExecutor
+    def evaluate_population(self, subjects, pop_size):
+        """Evaluate entire population sequentially"""
         fitness_scores = [0.0] * pop_size
         
-        def evaluate_single(i, sim):
+        # Evaluate each subject sequentially
+        for i in range(pop_size):
+            # Create simulation instance for this CNN (debug disabled during training)
+            sim = Simulation(enable_debug=False)
+            # Use the CNN directly from subjects
+            sim.organism_manager.energy_distribution_cnn = subjects[i]
+            
+            # Evaluate this CNN
             fitness_scores[i] = self._evaluate_single_cnn(sim, bot_index=i)
-        
-        # Use ThreadPoolExecutor for parallel execution, continuously pump GUI
-        import time as _time
-        with ThreadPoolExecutor(max_workers=min(pop_size, 64)) as executor:
-            futures = [executor.submit(evaluate_single, i, sim) for i, sim in enumerate(simulations)]
-            # While evaluations are running, keep the matplotlib window responsive
-            while True:
-                all_done = True
-                for f in futures:
-                    if not f.done():
-                        all_done = False
-                        break
-                if self.grapher is not None:
-                    try:
-                        self.grapher.process_queued()
-                    except Exception:
-                        pass
-                if all_done:
-                    break
-                _time.sleep(0.03)
-
-            # Ensure exceptions are surfaced
-            for f in futures:
-                f.result()
+            
+            # Process grapher queue periodically
+            if self.grapher is not None:
+                try:
+                    self.grapher.process_queued()
+                except Exception:
+                    pass
         
         return fitness_scores
     
-    def _create_cnn_from_kernel(self, kernel):
-        """Create a CNN with a specific kernel"""
-        cnn = EnergyDistributionCNN(self.device)
-        cnn.kernel.data = kernel.clone()
-        return cnn
-    
     def _evaluate_single_cnn(self, simulation, bot_index: int | None = None):
         """Evaluate a single CNN simulation"""
-        total_energy = 0.0
+        total_cell_count = 0.0
         
         # Run simulation for max_time steps
         for t in range(self.max_time):
             sim_data = simulation.update_simulation()
             
-            # Calculate fitness based on total energy and stability
-            current_energy = torch.sum(simulation.organism_manager.energy_matrix).item()
-            total_energy += current_energy
+            # Calculate fitness based on total cell count
+            current_cell_count = torch.sum(simulation.organism_manager.topology_matrix).item()
+            total_cell_count += current_cell_count
 
             # Tick graph update every 10 ticks if grapher attached
             if self.grapher is not None and t % 10 == 0:
-                org_energy = current_energy
+                org_energy = torch.sum(simulation.organism_manager.energy_matrix).item()
                 env_energy = torch.sum(simulation.environment.terrain).item()
                 total = org_energy + env_energy
                 # enqueue only; GUI update happens in main thread
-                # For fitness series, use cumulative fitness (total accumulated energy so far)
-                self.grapher.enqueue_tick(t, self.current_generation_max_fitness, [total_energy], org_energy, env_energy, total)
+                # For fitness series, use cumulative fitness (total accumulated cell count so far)
+                self.grapher.enqueue_tick(t, self.current_generation_max_fitness, [total_cell_count], org_energy, env_energy, total)
                 if bot_index is not None:
                     # For per-bot fitness series, use cumulative fitness
-                    self.grapher.enqueue_bot_tick(bot_index, t, total_energy, org_energy, env_energy, total)
+                    # Pass current_cell_count for org_energy parameter so organism graph shows cell count
+                    self.grapher.enqueue_bot_tick(bot_index, t, total_cell_count, current_cell_count, env_energy, total)
             
-            # Early termination if energy drops too low
-            if current_energy < CNN_FITNESS_EARLY_TERMINATION_THRESHOLD:
+            # Early termination if cell count drops to zero
+            if current_cell_count == 0:
                 break
                 
-        # Fitness is total accumulated energy over time (rewards high energy sustained longer)
-        fitness = total_energy
+        # Fitness is total accumulated cell count over time (rewards high cell count sustained longer)
+        fitness = total_cell_count
         return fitness
 
 
 class CNNEvolutionDriver:
-    """Evolution driver for CNN training with parallel GPU evaluation and replay"""
-    def __init__(self, world_size, epochs=CNN_DEFAULT_EPOCHS, max_time=CNN_DEFAULT_MAX_TIME):
+    """Evolution driver for CNN training with GPU evaluation and replay"""
+    def __init__(self, world_size, epochs=100, max_time=100):
         self.world_size = world_size
         self.epochs = epochs
         self.max_time = max_time
@@ -274,8 +303,8 @@ class CNNEvolutionDriver:
         # Genetic algorithm parameters
         self.ga = CNNGeneticAlgorithm(CNN_POPULATION_SIZE, CNN_MUTATION_RATE, CNN_MUTATION_MAGNITUDE, device)
         
-        # Parallel evaluator
-        self.evaluator = ParallelCNNEvaluator(world_size, max_time, device)
+        # Evaluator
+        self.evaluator = CNNEvaluator(world_size, max_time, device)
         self.grapher = None
         
         # Replay simulation for showing best organism
@@ -287,22 +316,22 @@ class CNNEvolutionDriver:
         test_sim = Simulation(enable_debug=False)
         test_sim.organism_manager.energy_distribution_cnn = cnn
         
-        total_energy = 0.0
+        total_cell_count = 0.0
         
         # Run simulation for max_time steps
         for t in range(self.max_time):
             sim_data = test_sim.update_simulation()
             
-            # Calculate fitness based on total energy and stability
-            current_energy = torch.sum(test_sim.organism_manager.energy_matrix).item()
-            total_energy += current_energy
+            # Calculate fitness based on total cell count
+            current_cell_count = torch.sum(test_sim.organism_manager.topology_matrix).item()
+            total_cell_count += current_cell_count
             
-            # Early termination if energy drops too low
-            if current_energy < CNN_FITNESS_EARLY_TERMINATION_THRESHOLD:
+            # Early termination if cell count drops to zero
+            if current_cell_count == 0:
                 break
                 
-        # Fitness is total accumulated energy over time
-        fitness = total_energy
+        # Fitness is total accumulated cell count over time
+        fitness = total_cell_count
         return fitness
     
     def create_replay_simulation(self, best_cnn):
@@ -324,24 +353,24 @@ class CNNEvolutionDriver:
             except Exception:
                 pass
         
-        print(f"Created replay simulation with best CNN (fitness: {self.ga.fitness_scores[self.ga.fittest_index]:.6f})")
+        print(f"Created replay simulation with best CNN (fitness/cell count: {self.ga.fitness_scores[self.ga.fittest_index]:.6f})")
         print("Press 'r' to toggle replay mode and see the best organism in action!")
         
     def run_evolution(self):
-        """Run the evolution process with parallel GPU evaluation"""
+        """Run the evolution process with sequential GPU evaluation"""
         print(f"\nStarting CNN Evolution - {self.epochs} generations")
         print(f"Population size: {CNN_POPULATION_SIZE}")
-        print(f"Using parallel GPU evaluation")
+        print(f"Using sequential GPU evaluation")
         
         for gen in range(self.epochs):
             print(f"\nGeneration {gen + 1}/{self.epochs}")
             
-            # Evaluate entire population in parallel
-            print("Evaluating population in parallel...")
+            # Evaluate entire population sequentially
+            print("Evaluating population...")
             if self.grapher is not None:
                 self.evaluator.grapher = self.grapher
-            fitness_scores = self.evaluator.evaluate_population_parallel(
-                self.ga.batched_kernels, 
+            fitness_scores = self.evaluator.evaluate_population(
+                self.ga.subjects, 
                 CNN_POPULATION_SIZE
             )
             
@@ -350,15 +379,19 @@ class CNNEvolutionDriver:
             
             # Print individual results
             for i, fitness in enumerate(fitness_scores):
-                print(f"CNN {i}: fitness = {fitness:.6f}")
+                print(f"CNN {i}: fitness (cell count) = {fitness:.6f}")
                 
             # Run one generation
             self.ga.compute_generation()
             
             # Print summary
             best_fitness = self.ga.fitness_scores[self.ga.fittest_index]
-            print(f"Best fitness: {best_fitness:.6f}")
-            print(f"Best CNN kernel:\n{self.ga.subjects[self.ga.fittest_index].kernel.data}")
+            print(f"Best fitness (cell count): {best_fitness:.6f}")
+            print(f"Best CNN conv1 weight shape: {self.ga.subjects[self.ga.fittest_index].conv1.weight.data.shape}")
+            print(f"Best CNN conv2 weight shape: {self.ga.subjects[self.ga.fittest_index].conv2.weight.data.shape}")
+            
+            # Save the fittest network every generation
+            self.ga.save_model(self.ga.fittest_index, generation=gen + 1)
             
             # Create replay simulation with best organism
             best_cnn = self.ga.subjects[self.ga.fittest_index]
@@ -399,13 +432,16 @@ class Environment:
         y = torch.arange(self.world_size, dtype=torch.float32, device=device)
         yy, xx = torch.meshgrid(y, x, indexing='ij')
         freq = self.noise_scale * NOISE_FREQUENCY_MULTIPLIER * (2.0 * np.pi)
-        values = torch.sin(xx * freq) * torch.sin(yy * freq)
-        # Normalize to 0-1
+        cx = self.world_size // 2
+        cy = self.world_size // 2
+        # Use cosine so that values are 1 at center (cos(0) = 1)
+        values = torch.cos((xx - cx) * freq) * torch.cos((yy - cy) * freq)
+        # Normalize to 0-1 (cosine ranges from -1 to 1)
         values = (values + 1.0) * 0.5
         # Shape distribution using power
         values = torch.pow(values, NOISE_POWER)
         # Apply dead mask similar to previous behavior
-        dead_mask = values > 0.3
+        dead_mask = values > 0.2
         values = values * dead_mask
         return torch.clamp(values, 0, 1)
     
@@ -413,6 +449,19 @@ class Environment:
         """Modify environment based on organism presence"""
         # Deplete terrain energy by the amount harvested
         self.terrain = torch.clamp(self.terrain - (harvested_energy * topology_matrix), 0, 1)
+        
+        # Apply terrain boost at organism starting positions
+        positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
+        if positions.numel() > 0:
+            y_coords, x_coords = positions[:, 1], positions[:, 0]
+            energy_radius = 1
+            circle_mask = torch.zeros((self.world_size, self.world_size), device=device)
+            circle_mask[y_coords, x_coords] = True
+            circle_mask = circle_mask.unsqueeze(0).unsqueeze(0)
+            circle_mask = torch.nn.functional.conv2d(circle_mask, torch.ones((1, 1, 2 * energy_radius + 1, 2 * energy_radius + 1), device=device), padding=energy_radius)
+            circle_mask = circle_mask.squeeze(0).squeeze(0)
+            circle_mask = circle_mask > 0
+            self.terrain[circle_mask] = self.terrain[circle_mask] + STARTING_POSITION_TERRAIN_BOOST
 
 class OrganismManager:
     def __init__(self, world_size, organism_count, terrain):
@@ -450,54 +499,164 @@ class OrganismManager:
         # Add selected positions to topology
         self.topology_matrix[energy_mask] = 1
     
-    def compute_energy(self, terrain):
-        """Deplete all energies by ENERGY_DECAY and allow energy sharing between adjacent cells"""
-        # Set organism energy to 1 in a 20-radius area BEFORE energy sharing calculation
+    def _apply_harvest_and_decay(self, terrain):
+        """Harvest energy from terrain and apply decay"""
         if terrain is not None:
             self.terrain = terrain
                 
-        # Remove organisms with energy below quantization step
+        # Remove organisms with energy below threshold
         low_energy_mask = self.energy_matrix < DEATH_THRESHOLD
         self.topology_matrix[low_energy_mask] = 0
         
-        # Apply energy decay inversely proportional to local 3x3 average energy
-        # Harvest energy from terrain where topology = 1, max harvest = ENERGY_HARVEST_RATE
-        harvested_energy = torch.minimum(self.terrain, torch.tensor(current_harvest_rate, device=device))
+        # Harvest energy from terrain
+        harvested_energy = torch.minimum(self.terrain, torch.tensor(ENERGY_HARVEST_RATE, device=device))
 
-        # Compute 10x10 local average energy (including center)
-        em = self.energy_matrix.unsqueeze(0).unsqueeze(0)
-        box_kernel = torch.ones((1, 1, 10, 10), device=device) / 100.0
-        # For even kernel sizes, padding leads to +1 output dimension; slice to original size
-        local_avg_full = torch.nn.functional.conv2d(em, box_kernel, padding=5)
-        local_avg = local_avg_full[:, :, :self.world_size, :self.world_size].squeeze(0).squeeze(0)
-        # Higher local energy -> less decay; lower local energy -> more decay
-        decay_map = (ENERGY_DECAY * (1.0 - local_avg) * ENERGY_DENSITY_DECAY_MODIFIER).clamp(0, ENERGY_DECAY)
-
-        self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - decay_map) * self.topology_matrix, 0, 1)
+        # Apply decay and harvest
+        self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - ENERGY_DECAY) * self.topology_matrix, 0, 1)
+        return harvested_energy
+    
+    def _compute_energy_contributions(self, shareable_energy, proportions):
+        """Compute energy contributions from each source to each neighbor"""
+        # (H, W) * (3, 3, H, W) -> (3, 3, H, W)
+        contributions = shareable_energy.unsqueeze(0).unsqueeze(0) * proportions
+        return contributions
+    
+    def _accumulate_contributions(self, contributions, shareable_energy):
+        """Accumulate contributions to destination cells"""
+        # Subtract shareable_energy from sources first (since it's being redistributed)
+        # Then add contributions which redistribute that energy (including center self-transfer)
+        new_energy_matrix = self.energy_matrix - shareable_energy
+        offsets = [(-1, -1), (-1, 0), (-1, 1),
+                  (0, -1),  (0, 0),  (0, 1),
+                  (1, -1),  (1, 0),  (1, 1)]
         
+        # Use coordinate-based indexing for correct mapping
+        y_coords = torch.arange(self.world_size, device=device).unsqueeze(1).expand(-1, self.world_size)
+        x_coords = torch.arange(self.world_size, device=device).unsqueeze(0).expand(self.world_size, -1)
+        for idx, (dy, dx) in enumerate(offsets):
+            ci, cj = idx // 3, idx % 3
+            # For each destination (y, x), get contribution from source at (y-dy, x-dx)
+            y_src = (y_coords - dy).clamp(0, self.world_size - 1)
+            x_src = (x_coords - dx).clamp(0, self.world_size - 1)
+            new_energy_matrix += contributions[ci, cj][y_src, x_src]
         
-        # Energy sharing between adjacent cells (conserving total energy)
-        sharing_rate = ENERGY_SHARING_RATE
+        return new_energy_matrix
+    
+    def _apply_capacity_constraints(self, new_energy_matrix, receiving_mask):
+        """Apply capacity constraints to limit received energy"""
+        capacity = (1.0 - self.energy_matrix) * receiving_mask
+        energy_incoming = new_energy_matrix - self.energy_matrix
+        actual_received = torch.min(energy_incoming, capacity)
+        new_energy_matrix = self.energy_matrix + actual_received
+        return new_energy_matrix, actual_received, energy_incoming
+    
+    def _compute_source_removed(self, contributions, dest_efficiency, receiving_mask):
+        """Compute how much energy each source should lose based on what was received"""
+        source_removed = torch.zeros_like(contributions[0, 0])
+        offsets = [(-1, -1), (-1, 0), (-1, 1),
+                  (0, -1),  (0, 0),  (0, 1),
+                  (1, -1),  (1, 0),  (1, 1)]
         
-        # Calculate how much energy each cell can share (only organisms can share)
-        shareable_energy = self.energy_matrix * self.topology_matrix * sharing_rate
+        for idx, (dy, dx) in enumerate(offsets):
+            ci, cj = idx // 3, idx % 3
+            y_coords = torch.arange(self.world_size, device=device)
+            x_coords = torch.arange(self.world_size, device=device)
+            y_dest = (y_coords.unsqueeze(1) + dy).clamp(0, self.world_size - 1)
+            x_dest = (x_coords.unsqueeze(0) + dx).clamp(0, self.world_size - 1)
+            
+            dest_eff = dest_efficiency[y_dest, x_dest]
+            contrib_amount = contributions[ci, cj]
+            source_removed += contrib_amount * dest_eff
         
-        # Distribute energy to adjacent cells using CNN
-        distributed_energy = self.energy_distribution_cnn(shareable_energy)
+        return source_removed
+    
+    def compute_energy(self, terrain):
+        """Main energy computation: harvest, decay, and sharing"""
+        harvested_energy = self._apply_harvest_and_decay(terrain)
         
-        # Store mask of where energy is shared but topology = 0 (new cell candidates)
-        self.new_cell_candidates = (distributed_energy > self.reproduction_threshold) & (self.topology_matrix == 0)
+        # Preserve source energy for reads (avoid race conditions)
+        source_energy = self.energy_matrix.clone()
         
-        # Only organisms can receive energy
-        receiving_mask = (self.topology_matrix + self.new_cell_candidates) > 0
+        # Calculate shareable energy (only organisms can share)
+        shareable_energy = source_energy * self.topology_matrix * ENERGY_SHARING_RATE
+        
+        # Get 3x3 proportions from CNN
+        proportions = self.energy_distribution_cnn(shareable_energy)
+        
+        # Compute contributions
+        contributions = self._compute_energy_contributions(shareable_energy, proportions)
+        
+        # Calculate new cell candidates - shift contributions to compute received energy at each destination
+        distributed_total = torch.zeros_like(self.energy_matrix)
+        offsets = [(-1, -1), (-1, 0), (-1, 1),
+                  (0, -1),  (0, 0),  (0, 1),
+                  (1, -1),  (1, 0),  (1, 1)]
+        # Use coordinate-based indexing like _compute_source_removed for correct mapping
+        y_coords = torch.arange(self.world_size, device=device).unsqueeze(1).expand(-1, self.world_size)
+        x_coords = torch.arange(self.world_size, device=device).unsqueeze(0).expand(self.world_size, -1)
+        for idx, (dy, dx) in enumerate(offsets):
+            ci, cj = idx // 3, idx % 3
+            # For each destination (y, x), get contribution from source at (y-dy, x-dx)
+            y_src = (y_coords - dy).clamp(0, self.world_size - 1)
+            x_src = (x_coords - dx).clamp(0, self.world_size - 1)
+            distributed_total += contributions[ci, cj][y_src, x_src]
+        
+        # Calculate new cell candidates
+        self.new_cell_candidates = (distributed_total > self.reproduction_threshold) & (self.topology_matrix == 0)
+        
+        # Receiving mask
+        receiving_mask = (self.topology_matrix.bool() | self.new_cell_candidates).float()
         
         if torch.any(receiving_mask):
-            # Remove shared energy from source cells FIRST
-            self.energy_matrix = torch.clamp(self.energy_matrix - shareable_energy, 0, 1)
+            # Calculate what can actually be received at each destination (before accumulating)
+            # This prevents energy loss when destinations hit capacity
+            capacity = (1.0 - self.energy_matrix) * receiving_mask
             
-            # Add distributed energy to destination cells (scale by 1/8 to conserve energy)
-            # Each cell shares with 8 neighbors, so we need to divide by 8
-            self.energy_matrix = torch.clamp(self.energy_matrix + (distributed_energy) * receiving_mask.float(), 0, 1)
+            # Calculate energy that would be incoming at each destination
+            temp_energy_matrix = self._accumulate_contributions(contributions, shareable_energy)
+            energy_incoming = temp_energy_matrix - self.energy_matrix
+            actual_received = torch.min(energy_incoming, capacity)
+            
+            # Calculate destination efficiency based on what can be received
+            dest_efficiency = torch.where(
+                energy_incoming > 0,
+                actual_received / energy_incoming,
+                torch.zeros_like(energy_incoming)
+            ) * receiving_mask
+            
+            # Compute source removal based on what will actually be received
+            source_removed = self._compute_source_removed(contributions, dest_efficiency, receiving_mask)
+            
+            # Build final energy matrix: start with current energy, subtract shareable_energy,
+            # then add only the portion of contributions that will actually be received
+            new_energy_matrix = self.energy_matrix - shareable_energy
+            
+            # Add contributions scaled by destination efficiency (only what can be received)
+            offsets = [(-1, -1), (-1, 0), (-1, 1),
+                      (0, -1),  (0, 0),  (0, 1),
+                      (1, -1),  (1, 0),  (1, 1)]
+            y_coords = torch.arange(self.world_size, device=device).unsqueeze(1).expand(-1, self.world_size)
+            x_coords = torch.arange(self.world_size, device=device).unsqueeze(0).expand(self.world_size, -1)
+            for idx, (dy, dx) in enumerate(offsets):
+                ci, cj = idx // 3, idx % 3
+                y_src = (y_coords - dy).clamp(0, self.world_size - 1)
+                x_src = (x_coords - dx).clamp(0, self.world_size - 1)
+                # For each destination (y, x), get contribution from source at (y-dy, x-dx)
+                # Scale by destination efficiency to only add what can be received
+                y_dest = y_coords
+                x_dest = x_coords
+                dest_eff = dest_efficiency[y_dest, x_dest]
+                new_energy_matrix += contributions[ci, cj][y_src, x_src] * dest_eff
+            
+            # Sources only lose what was actually sent and received (source_removed)
+            # Energy that couldn't be received stays with sources (shareable_energy - source_removed)
+            # Since we subtracted shareable_energy and only added scaled contributions,
+            # we need to add back the energy sources kept
+            new_energy_matrix = new_energy_matrix + (shareable_energy - source_removed)
+            
+            # Final update - preserve energy in existing cells and new candidates
+            valid_mask = (self.topology_matrix.bool() | self.new_cell_candidates).float()
+            self.energy_matrix = torch.clamp(new_energy_matrix * valid_mask, 0, 1)
         
         return harvested_energy
 class Renderer:
@@ -508,6 +667,10 @@ class Renderer:
         self.texture_id = None
         self.quad_vbo = None
         self.opengl_initialized = False
+        self.left_margin = 300
+        self.top_margin = 50
+        self.bottom_margin = 50
+        self.right_margin = 50
         self.debug_text_enabled = True
     
     def toggle_render_mode(self):
@@ -534,92 +697,96 @@ class Renderer:
     def render_text(self, x, y, text):
         """Render text at specified position"""
         try:
+            # Use glRasterPos2f with current projection/modelview matrices
             glRasterPos2f(x, y)
             for char in text:
                 glut.glutBitmapCharacter(glut.GLUT_BITMAP_8_BY_13, ord(char))
         except Exception as e:
             print(f"Text rendering error: {e}")
     
-    def render_debug_info(self, simulation_data, current_harvest_rate, replay_mode, current_best_cnn):
+    def render_debug_info(self, simulation_data, current_harvest_rate, replay_mode, current_best_cnn, logger=None):
         """Render debug information overlay"""
-        if not self.debug_text_enabled:
-            return
-        
 #        print(f"Rendering debug info: {len(lines)} lines")  # Debug output
             
         # Save current OpenGL state
         glPushAttrib(GL_ALL_ATTRIB_BITS)
+        
+        # Set viewport for debug text (full window)
+        window_width = self.world_size + self.left_margin + self.right_margin
+        window_height = self.world_size + self.top_margin + self.bottom_margin
+        glViewport(0, 0, window_width, window_height)
+        
         glMatrixMode(GL_PROJECTION)
         glPushMatrix()
         glLoadIdentity()
-        glOrtho(0, self.world_size, self.world_size, 0, -1, 1)  # Flip Y axis
+        glOrtho(0, window_width, window_height, 0, -1, 1)  # Flip Y axis
         glMatrixMode(GL_MODELVIEW)
         glPushMatrix()
         glLoadIdentity()
         
-        # Disable depth testing and enable blending for text
+        # Disable texture mapping and other states that interfere with text rendering
+        glDisable(GL_TEXTURE_2D)
         glDisable(GL_DEPTH_TEST)
         glEnable(GL_BLEND)
         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
         
-        # Set text color (bright green with slight transparency)
-        glColor4f(0.0*255, 1.0*255, 0.0*255, 0.95*255)
+        # Set text color (bright green)
+        glColor4f(0.0, 1.0, 0.0, 1.0)
         
         # Calculate text position (top-left corner, flipped coordinates)
+        # Add top_margin offset so text doesn't clip at the top
         text_x = 10
         text_y = 20
         line_height = 15
         
+        # Get actual FPS from logger
+        actual_fps = logger.get_fps() if logger else 0.0
+        
         # Render debug information
         lines = [
-            f"DEBUG TEXT TEST - VISIBLE?",
-            f"=== SIMULATION DEBUG ===",
-            f"Render Mode: {self.render_mode}",
-            f"Filters: {'ON' if self.filters_enabled else 'OFF'}",
-            f"Debug Text: {'ON' if self.debug_text_enabled else 'OFF'}",
-            f"Replay Mode: {'ON' if replay_mode else 'OFF'}",
+            f"FPS: {actual_fps:.1f}",
             f"",
-            f"=== CONFIGURATION ===",
-            f"World Size: {WORLD_SIZE}",
-            f"Organism Count: {ORGANISM_COUNT}",
-            f"Harvest Rate: {current_harvest_rate:.4f}",
-            f"Energy Decay: {ENERGY_DECAY:.4f}",
+            f"=== TOGGLES ===",
+            f"Render Mode (m): {self.render_mode}",
+            f"Filters (n): {'ON' if self.filters_enabled else 'OFF'}",
+            f"Harvesting (h): {'ON' if current_harvest_rate > 0 else 'OFF'}",
+            f"",
+            f"=== ENVIRONMENT CONFIG ===",
+            f"Noise Scale: {NOISE_SCALE}",
+            f"Quantization Step: {QUANTIZATION_STEP}",
+            f"Noise Frequency Multiplier: {NOISE_FREQUENCY_MULTIPLIER}",
+            f"Noise Octaves: {NOISE_OCTAVES}",
+            f"Noise Power: {NOISE_POWER}",
+            f"",
+            f"=== ORGANISM CONFIG ===",
+            f"Seed Count: {ORGANISM_COUNT}",
             f"Energy Sharing Rate: {ENERGY_SHARING_RATE}",
+            f"Energy Harvest Rate: {ENERGY_HARVEST_RATE:.4f}",
+            f"Energy Decay: {ENERGY_DECAY:.4f}",
             f"Reproduction Threshold: {REPRODUCTION_THRESHOLD:.4f}",
             f"Death Threshold: {DEATH_THRESHOLD:.4f}",
+            f"Energy Density Decay Modifier: {ENERGY_DENSITY_DECAY_MODIFIER}",
+            f"Seed Boost: {STARTING_POSITION_TERRAIN_BOOST}",
             f"",
             f"=== SIMULATION STATE ===",
         ]
         
         # Add simulation data if available
         if simulation_data:
-            total_energy = torch.sum(simulation_data['energy']).item()
-            total_terrain = torch.sum(simulation_data['terrain']).item()
+            organism_energy = torch.sum(simulation_data['energy']).item()
+            terrain_energy = torch.sum(simulation_data['terrain']).item()
+            total_energy = organism_energy + terrain_energy
             topology_count = torch.sum(simulation_data['topology']).item()
             new_cells = torch.sum(simulation_data['new_cell_candidates']).item()
             
             lines.extend([
-                f"Total Energy: {total_energy:.2f}",
-                f"Total Terrain: {total_terrain:.2f}",
-                f"Organisms: {topology_count:.0f}",
+                f"System Energy: {total_energy:.2f}",
+                f"Terrain Energy: {terrain_energy:.2f}",
+                f"Organism Energy: {organism_energy:.2f}",
+                f"Cells: {topology_count:.0f}",
                 f"New Cell Candidates: {new_cells:.0f}",
             ])
-        
-        # Add CNN info if available
-        if current_best_cnn is not None:
-            lines.extend([
-                f"",
-                f"=== CNN STATE ===",
-                f"Best CNN Active: YES",
-                f"Kernel Center: {current_best_cnn.kernel.data[1, 1].item():.3f}",
-            ])
-        else:
-            lines.extend([
-                f"",
-                f"=== CNN STATE ===",
-                f"Best CNN Active: NO",
-            ])
-        
+
         # Render each line
         for i, line in enumerate(lines):
             self.render_text(text_x, text_y + (i * line_height), line)
@@ -712,13 +879,29 @@ class Renderer:
         glBindTexture(GL_TEXTURE_2D, self.texture_id)
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, self.world_size, self.world_size, 0, GL_RGB, GL_UNSIGNED_BYTE, image_np)
     
-    def render_opengl(self, simulation_data=None, current_harvest_rate=0, replay_mode=False, current_best_cnn=None):
+    def render_opengl(self, simulation_data=None, current_harvest_rate=0, replay_mode=False, current_best_cnn=None, logger=None):
         """Render using OpenGL (OpenGL 2.1 compatible) with debug text"""
         if not self.opengl_initialized:
             return
             
         # Clear screen
         glClear(GL_COLOR_BUFFER_BIT)
+        
+        # Set viewport for world rendering (offset by margins)
+        # OpenGL viewport Y is measured from bottom-left corner
+        # Position world so its top edge aligns with debug text (top_margin from top)
+        window_height = self.world_size + self.top_margin + self.bottom_margin
+        # To have top_margin at top: viewport_y = window_height - top_margin - world_size
+        # This positions the world's top edge at top_margin from the window top
+        viewport_y = window_height - self.top_margin - self.world_size
+        glViewport(self.left_margin, viewport_y, self.world_size, self.world_size)
+        
+        # Ensure correct matrix mode for world rendering
+        glMatrixMode(GL_PROJECTION)
+        glLoadIdentity()
+        glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0)
+        glMatrixMode(GL_MODELVIEW)
+        glLoadIdentity()
         
         # Enable texture mapping
         glEnable(GL_TEXTURE_2D)
@@ -737,7 +920,7 @@ class Renderer:
         glEnd()
         
         # Render debug text overlay
-        self.render_debug_info(simulation_data, current_harvest_rate, replay_mode, current_best_cnn)
+        self.render_debug_info(simulation_data, current_harvest_rate, replay_mode, current_best_cnn, logger)
         
         # Swap buffers
         glutSwapBuffers()
@@ -795,15 +978,70 @@ class Simulation:
         self.tick = 0
     
 
-def start_cnn_evolution(grapher: Grapher | None = None):
+def clear_saved_networks():
+    """Clear all saved .pt network files from data directory"""
+    pattern = 'data/cnn_*.pt'
+    files = glob.glob(pattern)
+    for file in files:
+        try:
+            os.remove(file)
+            print(f"Removed: {file}")
+        except Exception as e:
+            print(f"Error removing {file}: {e}")
+    if files:
+        print(f"Cleared {len(files)} saved network files")
+
+def load_latest_cnn():
+    """Load the latest saved CNN model and return it"""
+    # Find all .pt files in data directory
+    pattern = 'data/cnn_*_gen*_*.pt'
+    files = glob.glob(pattern)
+    
+    if not files:
+        print("No saved models found in data/ directory")
+        return None
+    
+    # Sort by modification time (newest first)
+    files.sort(key=os.path.getmtime, reverse=True)
+    
+    # Get the most recent file
+    latest_file = files[0]
+    
+    try:
+        # Create a CNN instance
+        cnn = EnergyDistributionCNN(device)
+        # Load the state dict
+        state_dict = torch.load(latest_file, map_location=device)
+        cnn.load_state_dict(state_dict)
+        print(f"Loaded model: {latest_file}")
+        return cnn
+    except Exception as e:
+        print(f"Couldn't load {latest_file}: {e}")
+        return None
+
+def start_cnn_evolution(grapher: Grapher | None = None, load_latest=False):
     """Start CNN evolution training"""
     print("Starting CNN Evolution Training...")
     evolution_driver = CNNEvolutionDriver(WORLD_SIZE, epochs=CNN_TRAINING_EPOCHS, max_time=CNN_TRAINING_MAX_TIME)
+    
+    # Load latest model if requested
+    if load_latest:
+        if evolution_driver.ga.load_latest_model():
+            # Copy loaded model to all subjects (as if it was the fittest from previous run)
+            parent = evolution_driver.ga.subjects[0]
+            for i in range(1, CNN_POPULATION_SIZE):
+                evolution_driver.ga.subjects[i].conv1.weight.data = parent.conv1.weight.data.clone()
+                evolution_driver.ga.subjects[i].conv1.bias.data = parent.conv1.bias.data.clone()
+                evolution_driver.ga.subjects[i].conv2.weight.data = parent.conv2.weight.data.clone()
+                evolution_driver.ga.subjects[i].conv2.bias.data = parent.conv2.bias.data.clone()
+            print("Loaded latest model and initialized population from it")
+    
     evolution_driver.grapher = grapher
     best_cnn = evolution_driver.run_evolution()
     
-    print(f"\nTraining completed! Best CNN kernel:")
-    print(best_cnn.kernel.data)
+    print(f"\nTraining completed! Best CNN parameters:")
+    print(f"conv1 weight shape: {best_cnn.conv1.weight.data.shape}")
+    print(f"conv2 weight shape: {best_cnn.conv2.weight.data.shape}")
     
     return best_cnn
     
@@ -812,17 +1050,27 @@ def main():
     """Main simulation loop with GPU-accelerated OpenGL rendering"""
     parser = argparse.ArgumentParser()
     parser.add_argument('--train', action='store_true', help='Run CNN training mode (no OpenGL sim)')
+    parser.add_argument('--load', action='store_true', help='Load the fittest model from the last generation of the last run (works with --train or normal sim)')
     args, _ = parser.parse_known_args()
 
     if args.train:
+        # Clear saved networks at the beginning of training
+        clear_saved_networks()
+        
         # Training mode with matplotlib graphs
         grapher = Grapher()
-        start_cnn_evolution(grapher)
+        start_cnn_evolution(grapher, load_latest=args.load)
         return
     # Initialize OpenGL/GLUT
     glut.glutInit()
     glut.glutInitDisplayMode(glut.GLUT_DOUBLE | glut.GLUT_RGB)
-    glut.glutInitWindowSize(WORLD_SIZE, WORLD_SIZE)
+    left_margin = 300
+    top_margin = 10
+    bottom_margin = 10
+    right_margin = 10
+    window_width = WORLD_SIZE + left_margin + right_margin
+    window_height = WORLD_SIZE + top_margin + bottom_margin
+    glut.glutInitWindowSize(window_width, window_height)
     glut.glutCreateWindow(b"Organism Simulation - OpenGL GPU Accelerated")
     
     # Setup OpenGL
@@ -830,7 +1078,7 @@ def main():
     glClearColor(OPENGL_CLEAR_COLOR_R, OPENGL_CLEAR_COLOR_G, OPENGL_CLEAR_COLOR_B, OPENGL_CLEAR_COLOR_A)
     
     # Set up viewport and projection for full-screen rendering
-    glViewport(0, 0, WORLD_SIZE, WORLD_SIZE)
+    glViewport(0, 0, window_width, window_height)
     glMatrixMode(GL_PROJECTION)
     glLoadIdentity()
     glOrtho(-1.0, 1.0, -1.0, 1.0, -1.0, 1.0)
@@ -838,7 +1086,20 @@ def main():
     glLoadIdentity()
     
     simulation = Simulation()
+    
+    # Load model if requested
+    if args.load:
+        loaded_cnn = load_latest_cnn()
+        if loaded_cnn is not None:
+            simulation.organism_manager.energy_distribution_cnn = loaded_cnn
+            print("Using loaded model in simulation")
+        else:
+            print("Failed to load model, using default CNN")
+    
     renderer = Renderer(WORLD_SIZE)
+    renderer.top_margin = top_margin
+    renderer.bottom_margin = bottom_margin
+    renderer.right_margin = right_margin
     input_handler = InputHandler(renderer)
     
     # Initialize OpenGL components after context is created
@@ -870,7 +1131,9 @@ def main():
         if last_sim_data is not None:
             # Update OpenGL texture and render
             current_renderer.update_texture(current_renderer.last_image)
-            current_renderer.render_opengl(last_sim_data, current_harvest_rate, replay_mode, current_best_cnn)
+            # Get logger from simulation for FPS display
+            logger = current_simulation.logger if hasattr(current_simulation, 'logger') else None
+            current_renderer.render_opengl(last_sim_data, current_harvest_rate, replay_mode, current_best_cnn, logger)
     
     def keyboard(key, x, y):
         """OpenGL keyboard callback"""
@@ -891,24 +1154,6 @@ def main():
             else:
                 current_harvest_rate = 0
                 print("Harvest rate disabled: 0")
-        elif key == b't':
-            # Start CNN training
-            print("Starting CNN evolution training...")
-            best_cnn = start_cnn_evolution()
-            # Replace current CNN with trained one
-            current_simulation.organism_manager.energy_distribution_cnn = best_cnn
-            print("CNN training completed and applied!")
-        elif key == b'r':
-            # Toggle replay mode
-            global replay_mode
-            replay_mode = not replay_mode
-            if replay_mode:
-                print("Replay mode enabled - showing best organism from last generation")
-            else:
-                print("Replay mode disabled - showing normal simulation")
-        elif key == b'd':
-            # Toggle debug text
-            current_renderer.toggle_debug_text()
     
     # Frame rate control - ONLY for rendering/OpenGL
     rendering_frame_counter = 0
