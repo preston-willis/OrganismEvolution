@@ -44,92 +44,130 @@ class EnergyDistributionCNN(torch.nn.Module):
     def __init__(self, device):
         super().__init__()
         self.device = device
-        # Conv layers for processing perception vectors
-        # Input: 18 channels (from perceive: 3*channel_n where channel_n=6 for shareable_energy + terrain + sharing_rate + 3 hidden channels)
+        # Conv layers for processing input channels directly
+        # Input: 6 channels (shareable_energy + terrain + sharing_rate + 3 hidden channels)
         # Output: 13 channels (9 for 3x3 distribution matrix + 1 for sharing_rate + 3 for hidden channels)
-        self.conv1 = torch.nn.Conv2d(18, 32, kernel_size=3, padding=1, device=device)
+        # conv1 now processes rotated 3x3 patches with stride=3 (skips 3 cells)
+        self.conv1 = torch.nn.Conv2d(6, 32, kernel_size=3, stride=3, padding=0, device=device)
         self.conv2 = torch.nn.Conv2d(32, 13, kernel_size=1, device=device) 
+        
+        # Pre-compute rotation permutation lookup table on GPU (90° rotations only)
+        # Each row contains the permutation indices for that rotation direction
+        # For 3x3 grid: 0 1 2 / 3 4 5 / 6 7 8
+        rotations = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8],  # 0° (no rotation)
+            [6, 3, 0, 7, 4, 1, 8, 5, 2],  # 90° CCW
+            [8, 7, 6, 5, 4, 3, 2, 1, 0],  # 180°
+            [2, 5, 8, 1, 4, 7, 0, 3, 6],  # 270° CCW (90° CW)
+        ]
+        self.rotation_lookup = torch.tensor(rotations, dtype=torch.long, device=device)  # (4, 9)
+        
+        # Inverse rotation lookup for rotating output back to world coordinates
+        # Inverse of: 0°→0°, 90°→270°, 180°→180°, 270°→90°
+        inverse_rotations = [
+            [0, 1, 2, 3, 4, 5, 6, 7, 8],  # 0° inverse (0°)
+            [2, 5, 8, 1, 4, 7, 0, 3, 6],  # 90° inverse (270°)
+            [8, 7, 6, 5, 4, 3, 2, 1, 0],  # 180° inverse (180°)
+            [6, 3, 0, 7, 4, 1, 8, 5, 2],  # 270° inverse (90°)
+        ]
+        self.inverse_rotation_lookup = torch.tensor(inverse_rotations, dtype=torch.long, device=device)  # (4, 9)
+        
         # Move model to device
         self.to(device)
 
-    def perceive(self, x, angle=0.0):
-        
-        channel_n = x.shape[1]
-        
-        # Identity kernel: [0, 1, 0] outer product
-        identify = torch.tensor([0.0, 1.0, 0.0], device=x.device, dtype=x.dtype)
-        identify = torch.outer(identify, identify)
-        
-        # Sobel filter for dx
-        dx = torch.outer(
-            torch.tensor([1.0, 2.0, 1.0], device=x.device, dtype=x.dtype),
-            torch.tensor([-1.0, 0.0, 1.0], device=x.device, dtype=x.dtype)
-        ) / 8.0
-        dy = dx.T
-        
-        # Rotation
-        c = torch.cos(torch.tensor(angle, device=x.device, dtype=x.dtype))
-        s = torch.sin(torch.tensor(angle, device=x.device, dtype=x.dtype))
-        
-        # Stack kernels: [identity, rotated_dx, rotated_dy]
-        kernel = torch.stack([
-            identify,
-            c * dx - s * dy,
-            s * dx + c * dy
-        ], dim=-1)  # (3, 3, 3)
-        
-        # Add channel dimension: (3, 3, 1, 3)
-        kernel = kernel.unsqueeze(2)
-        
-        # Repeat for each input channel: (3, 3, channel_n, 3)
-        kernel = kernel.repeat(1, 1, channel_n, 1)
-        
-        # Reshape for depthwise conv2d: (out_channels=3*channel_n, in_channels=1, 3, 3)
-        # For depthwise, we need (out_channels, in_channels/groups, H, W) where groups=channel_n
-        # So we reshape to (3*channel_n, 1, 3, 3)
-        kernel = kernel.permute(3, 2, 0, 1)  # (3, channel_n, 3, 3)
-        kernel = kernel.reshape(3 * channel_n, 1, 3, 3)
-        
-        # Depthwise convolution: groups=channel_n means each input channel gets its own filter
-        # Output will have 3*channel_n channels (3 perception channels per input channel)
-        y = torch.nn.functional.conv2d(x, kernel, padding=1, stride=1, groups=channel_n)
-        
-        return y
-        
-    def forward(self, shareable_energy, terrain, sharing_rate, hidden_channels):
+    def _discretize_rotations_batch(self, angles):
+        """Convert continuous angles to discrete 90° directions (0-3) for all patches at once"""
+        # Normalize angles to [0, 2π)
+        angles = angles % (2 * torch.pi)
+        # Convert to 4 directions: 0=0°, 1=90°, 2=180°, 3=270°
+        directions = (angles / (2 * torch.pi) * 4).long() % 4
+        return directions
+    
+    def forward(self, shareable_energy, terrain, sharing_rate, hidden_channels, rotation_matrix):
         """
         Input: 
             shareable_energy of shape (world_size, world_size)
             terrain of shape (world_size, world_size)
             sharing_rate of shape (world_size, world_size)
             hidden_channels of shape (3, world_size, world_size)
+            rotation_matrix of shape (world_size, world_size) - rotation angles for each cell
         Output: 
             proportions of shape (3, 3, world_size, world_size)
             sharing_rate_output of shape (world_size, world_size)
             hidden_channels_output of shape (3, world_size, world_size)
         """
-        shareable_energy = shareable_energy.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-        terrain = terrain.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-        sharing_rate = sharing_rate.unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
-        hidden_channels = hidden_channels.unsqueeze(0)  # (1, 3, H, W)
+        world_size = shareable_energy.shape[0]
         
-        # Stack channels: (1, 6, H, W)
-        input_channels = torch.cat([shareable_energy, terrain, sharing_rate, hidden_channels], dim=1)
-        perception_vector = self.perceive(input_channels)  # (B, 18, H, W)
-
-        x = self.conv1(perception_vector)
+        # Stack input channels: (6, H, W)
+        input_channels = torch.cat([
+            shareable_energy.unsqueeze(0),
+            terrain.unsqueeze(0),
+            sharing_rate.unsqueeze(0),
+            hidden_channels
+        ], dim=0)  # (6, H, W)
+        
+        # Extract 3x3 patches for each cell with padding
+        padded = torch.nn.functional.pad(input_channels, (1, 1, 1, 1), mode='circular')  # (6, H+2, W+2)
+        
+        # Extract patches: (6, H, W, 3, 3)
+        patches = padded.unfold(1, 3, 1).unfold(2, 3, 1)  # (6, H, W, 3, 3)
+        patches = patches.permute(1, 2, 0, 3, 4)  # (H, W, 6, 3, 3)
+        
+        # Reshape to batch: (H*W, 6, 3, 3)
+        patches_flat = patches.reshape(world_size * world_size, 6, 3, 3)
+        rotation_flat = rotation_matrix.reshape(world_size * world_size)
+        
+        # Discretize all rotation angles to directions at once (GPU operation)
+        directions = self._discretize_rotations_batch(rotation_flat)  # (H*W,)
+        
+        # Flatten patches to (H*W, 6, 9) for gather operation
+        patches_flat_2d = patches_flat.view(world_size * world_size, 6, 9)  # (H*W, 6, 9)
+        
+        # Get permutation indices for each patch: (H*W, 9)
+        perm_indices = self.rotation_lookup[directions]  # (H*W, 9)
+        
+        # Expand perm_indices to match channel dimension: (H*W, 6, 9)
+        perm_indices_expanded = perm_indices.unsqueeze(1).expand(-1, 6, -1)  # (H*W, 6, 9)
+        
+        # Gather rotated patches along the last dimension (position indices)
+        # This applies the permutation to all patches in parallel
+        rotated_flat = torch.gather(patches_flat_2d, 2, perm_indices_expanded)  # (H*W, 6, 9)
+        
+        # Reshape back to (H*W, 6, 3, 3)
+        batch_patches = rotated_flat.view(world_size * world_size, 6, 3, 3)
+        
+        # Process through conv1 with stride=3: (H*W, 16, 1, 1)
+        x = self.conv1(batch_patches)
         x = torch.nn.functional.relu(x)
-        x = self.conv2(x)  # (B, 13, H, W)
+        x = self.conv2(x)  # (H*W, 13, 1, 1)
+        
+        # Reshape back to spatial dimensions: (H, W, 13)
+        x = x.squeeze(-1).squeeze(-1)  # (H*W, 13)
+        x = x.view(world_size, world_size, 13)  # (H, W, 13)
+        x = x.permute(2, 0, 1)  # (13, H, W)
         
         # Split output: 9 channels for proportions, 1 channel for sharing_rate, 3 channels for hidden
-        proportions_flat = x[:, :9, :, :]  # (B, 9, H, W)
-        sharing_rate_output = x[:, 9:10, :, :].squeeze(0).squeeze(0)  # (H, W)
-        hidden_channels_output = x[:, 10:13, :, :].squeeze(0)  # (3, H, W)
+        proportions_flat = x[:9]  # (9, H, W)
+        sharing_rate_output = x[9:10].squeeze(0)  # (H, W)
+        hidden_channels_output = x[10:13]  # (3, H, W)
         
-        proportions_flat = torch.nn.functional.softmax(proportions_flat, dim=1)  # (B, 9, H, W)
+        proportions_flat = torch.nn.functional.softmax(proportions_flat, dim=0)  # (9, H, W)
         
         # Reshape to (3, 3, H, W) - each cell has its 3x3 distribution matrix
-        proportions = proportions_flat.squeeze(0).view(3, 3, WORLD_SIZE, WORLD_SIZE)  # (3, 3, H, W)
+        proportions = proportions_flat.view(3, 3, world_size, world_size)  # (3, 3, H, W)
+        
+        # Rotate output back to world coordinates
+        # Reshape proportions to (H*W, 3, 3) for batch rotation
+        proportions_flat_batch = proportions.permute(2, 3, 0, 1).reshape(world_size * world_size, 9)  # (H*W, 9)
+        
+        # Get inverse permutation indices for each cell: (H*W, 9)
+        inverse_perm_indices = self.inverse_rotation_lookup[directions]  # (H*W, 9)
+        
+        # Apply inverse rotation to rotate output back to world coordinates
+        proportions_rotated_back = torch.gather(proportions_flat_batch, 1, inverse_perm_indices)  # (H*W, 9)
+        
+        # Reshape back to (3, 3, H, W)
+        proportions = proportions_rotated_back.view(world_size, world_size, 9).permute(2, 0, 1).view(3, 3, world_size, world_size)  # (3, 3, H, W)
         
         # Clamp sharing_rate_output to valid range
         sharing_rate_output = torch.tanh(sharing_rate_output)  # (H, W)
@@ -581,12 +619,18 @@ class Environment:
         freq = self.noise_scale * NOISE_FREQUENCY_MULTIPLIER * (2.0 * np.pi)
         cx = self.world_size // 2
         cy = self.world_size // 2
+        # Exponential radial decay from center to dampen amplitude
+        dist = torch.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+        max_dist = torch.tensor(self.world_size / 2, dtype=torch.float32, device=device)
+        radial_decay = torch.exp(-dist / max_dist)
         # Use cosine so that values are 1 at center (cos(0) = 1)
         values = torch.cos((xx - cx) * freq) * torch.cos((yy - cy) * freq)
         # Normalize to 0-1 (cosine ranges from -1 to 1)
         values = (values + 1.0) * 0.5
         # Shape distribution using power
         values = torch.pow(values, NOISE_POWER)
+        # Apply radial decay
+        values = values * radial_decay
         
         # Add 4 more energy sources 3px away from center in cardinal directions
         offset = 1
@@ -600,7 +644,8 @@ class Environment:
         for sx, sy in sources:
             source_values = torch.cos((xx - sx) * freq) * torch.cos((yy - sy) * freq)
             source_values = (source_values + 1.0) * 0.5
-            source_values = torch.pow(source_values, NOISE_POWER)
+            # Apply same shaping and radial decay to source peaks
+            source_values = torch.pow(source_values, NOISE_POWER) * (radial_decay**2)
             values = torch.maximum(values, source_values)
         
         # Apply dead mask similar to previous behavior
@@ -611,36 +656,36 @@ class Environment:
     def compute_environment(self, topology_matrix, harvested_energy):
         """Modify environment based on organism presence"""
         # Deplete terrain energy by the amount harvested
-        self.terrain = torch.clamp(self.terrain - (harvested_energy * topology_matrix), 0, 1)
+        self.terrain = torch.clamp(self.terrain - (harvested_energy * 0.1 * topology_matrix), 0, 1)
         
-        # Apply terrain boost at organism starting positions
-        positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
-        if positions.numel() > 0:
-            # Create 4 additional sources 3px away from each original position
-            additional_positions = []
-            for pos in positions:
-                x, y = pos[0].item(), pos[1].item()
-                offsets = [(-5, 0), (5, 0), (0, -5), (0, 5)]
-                for dx, dy in offsets:
-                    new_x, new_y = x + dx, y + dy
-                    if 0 <= new_x < self.world_size and 0 <= new_y < self.world_size:
-                        additional_positions.append([new_x, new_y])
+        # # Apply terrain boost at organism starting positions
+        # positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
+        # if positions.numel() > 0:
+        #     # Create 4 additional sources 3px away from each original position
+        #     additional_positions = []
+        #     for pos in positions:
+        #         x, y = pos[0].item(), pos[1].item()
+        #         offsets = [(-5, 0), (5, 0), (0, -5), (0, 5)]
+        #         for dx, dy in offsets:
+        #             new_x, new_y = x + dx, y + dy
+        #             if 0 <= new_x < self.world_size and 0 <= new_y < self.world_size:
+        #                 additional_positions.append([new_x, new_y])
             
-            if additional_positions:
-                additional_positions_tensor = torch.tensor(additional_positions, dtype=torch.long, device=device)
-                all_positions = torch.cat([positions, additional_positions_tensor], dim=0)
-            else:
-                all_positions = positions
+        #     if additional_positions:
+        #         additional_positions_tensor = torch.tensor(additional_positions, dtype=torch.long, device=device)
+        #         all_positions = torch.cat([positions, additional_positions_tensor], dim=0)
+        #     else:
+        #         all_positions = positions
             
-            y_coords, x_coords = all_positions[:, 1], all_positions[:, 0]
-            energy_radius = 1
-            circle_mask = torch.zeros((self.world_size, self.world_size), device=device)
-            circle_mask[y_coords, x_coords] = True
-            circle_mask = circle_mask.unsqueeze(0).unsqueeze(0)
-            circle_mask = torch.nn.functional.conv2d(circle_mask, torch.ones((1, 1, 2 * energy_radius + 1, 2 * energy_radius + 1), device=device), padding=energy_radius)
-            circle_mask = circle_mask.squeeze(0).squeeze(0)
-            circle_mask = circle_mask > 0
-            self.terrain[circle_mask] = self.terrain[circle_mask] + STARTING_POSITION_TERRAIN_BOOST
+        #     y_coords, x_coords = all_positions[:, 1], all_positions[:, 0]
+        #     energy_radius = 1
+        #     circle_mask = torch.zeros((self.world_size, self.world_size), device=device)
+        #     circle_mask[y_coords, x_coords] = True
+        #     circle_mask = circle_mask.unsqueeze(0).unsqueeze(0)
+        #     circle_mask = torch.nn.functional.conv2d(circle_mask, torch.ones((1, 1, 2 * energy_radius + 1, 2 * energy_radius + 1), device=device), padding=energy_radius)
+        #     circle_mask = circle_mask.squeeze(0).squeeze(0)
+        #     circle_mask = circle_mask > 0
+        #     self.terrain[circle_mask] = self.terrain[circle_mask] + STARTING_POSITION_TERRAIN_BOOST
             
 
 class OrganismManager:
@@ -653,6 +698,7 @@ class OrganismManager:
         self.energy_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
         self.sharing_rate_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
         self.hidden_channels = torch.zeros((3, world_size, world_size), dtype=torch.float32, device=device)
+        self.rotation_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
         self.new_cell_candidates = torch.zeros((world_size, world_size), dtype=torch.bool, device=device)
         self._initialize_topology()
         
@@ -670,6 +716,7 @@ class OrganismManager:
             self.energy_matrix[y_coords, x_coords] = 1
             self.sharing_rate_matrix[y_coords, x_coords] = ENERGY_SHARING_RATE
             self.hidden_channels[:, y_coords, x_coords] = 0
+            self.rotation_matrix[y_coords, x_coords] = 0
     
     def compute_topology(self):
         """Reproduce using new_cell_candidates mask from energy sharing"""
@@ -679,6 +726,38 @@ class OrganismManager:
         
         # Check energy threshold on the new cell candidates
         energy_mask = (self.energy_matrix >= self.reproduction_threshold) * self.new_cell_candidates
+        
+        # Calculate rotation for new cells based on parent energy contributions
+        if torch.any(energy_mask) and self.new_cell_contributions is not None:
+            offsets = [(-1, -1), (-1, 0), (-1, 1),
+                      (0, -1),  (0, 0),  (0, 1),
+                      (1, -1),  (1, 0),  (1, 1)]
+            
+            y_coords = torch.arange(self.world_size, device=device).unsqueeze(1).expand(-1, self.world_size)
+            x_coords = torch.arange(self.world_size, device=device).unsqueeze(0).expand(self.world_size, -1)
+            
+            # Calculate weighted direction vectors for new cells
+            weighted_dx = torch.zeros_like(self.energy_matrix)
+            weighted_dy = torch.zeros_like(self.energy_matrix)
+            total_weight = torch.zeros_like(self.energy_matrix)
+            
+            for idx, (dy, dx) in enumerate(offsets):
+                ci, cj = idx // 3, idx % 3
+                # For each new cell at (y, x), contributions[ci, cj][y, x] is the energy
+                # that arrived at (y, x) from parent at (y-dy, x-dx)
+                # Get contributions that went to new cell candidates
+                contrib = self.new_cell_contributions[ci, cj] * energy_mask
+                
+                # Weight by contribution amount, direction is (dx, dy) - away from parent
+                weighted_dx += contrib * dx
+                weighted_dy += contrib * dy
+                total_weight += contrib
+            
+            # Calculate rotation angle (atan2 gives angle from positive x-axis)
+            # Only calculate where there are new cells and non-zero weights
+            rotation_mask = energy_mask & (total_weight > 0)
+            rotation_angles = torch.atan2(weighted_dy, weighted_dx)
+            self.rotation_matrix[rotation_mask] = rotation_angles[rotation_mask]
         
         # Add selected positions to topology
         self.topology_matrix[energy_mask] = 1
@@ -697,18 +776,17 @@ class OrganismManager:
         self.topology_matrix[low_energy_mask] = 0
         self.sharing_rate_matrix[low_energy_mask] = 0
         self.hidden_channels[:, low_energy_mask] = 0
+        self.rotation_matrix[low_energy_mask] = 0
         
         # Harvest energy from terrain
         harvested_energy = torch.minimum(self.terrain, self.sharing_rate_matrix * ENERGY_HARVEST_RATE)
         
-        # Count number of 0.0 cells in 3x3 neighborhood for decay scaling
+        # Calculate average energy in 3x3 neighborhood for decay scaling
         energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0) + terrain.unsqueeze(0).unsqueeze(0)
-        zero_mask = (energy_unsqueezed == 0.0).float()
-        count_kernel = torch.ones((1, 1, 3, 3), device=device, dtype=torch.float32)
-        zero_count = torch.nn.functional.conv2d(zero_mask, count_kernel, padding=1).squeeze(0).squeeze(0)
-
+        average_energy = torch.nn.functional.conv2d(energy_unsqueezed, torch.ones((1, 1, 3, 3), device=device, dtype=torch.float32), padding=1).squeeze(0).squeeze(0) / 9
+    
         # Apply decay with factor proportional to cell's distribution rate and number of 0.0 cells in neighborhood
-        decay_amount = self.sharing_rate_matrix * ENERGY_DECAY * zero_count * 2
+        decay_amount = self.sharing_rate_matrix**2 * (1-average_energy) * 0.1
         # Apply decay and harvest
         self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - decay_amount - ENERGY_DECAY) * self.topology_matrix, 0, 1)
 
@@ -780,7 +858,7 @@ class OrganismManager:
         shareable_energy = source_energy * self.topology_matrix * self.sharing_rate_matrix
         
         # Get 3x3 proportions, sharing_rate output, and hidden_channels output from CNN
-        proportions, sharing_rate_output, hidden_channels_output = self.energy_distribution_cnn(shareable_energy, terrain, self.sharing_rate_matrix, self.hidden_channels)
+        proportions, sharing_rate_output, hidden_channels_output = self.energy_distribution_cnn(shareable_energy, terrain, self.sharing_rate_matrix, self.hidden_channels, self.rotation_matrix)
         
         # Update sharing_rate_matrix with CNN output (only for cells that exist)
         self.sharing_rate_matrix += self.sharing_rate_matrix * (1 - self.topology_matrix) + sharing_rate_output/50 * self.topology_matrix
@@ -810,6 +888,9 @@ class OrganismManager:
         
         # Calculate new cell candidates
         self.new_cell_candidates = (distributed_total > self.reproduction_threshold) & (self.topology_matrix == 0)
+        
+        # Store contributions to new cell candidates for rotation calculation
+        self.new_cell_contributions = contributions.clone() if torch.any(self.new_cell_candidates) else None
         
         # Receiving mask
         receiving_mask = (self.topology_matrix.bool() | self.new_cell_candidates).float()
@@ -1031,9 +1112,9 @@ class Renderer:
                 sharing_rate_clamped = sharing_rate.clamp(0, 1)
                 print(sharing_rate_clamped)
                 image[0] = topology + (1 - topology) * 0.0
-                image[1] = topology * (sharing_rate_clamped) + (1 - topology) * env_scaled
-                image[2] = topology * (sharing_rate_clamped) + (1 - topology) * env_scaled
-                image[3] = topology * torch.clamp(mask, 0.5, 1) + (1 - topology) * env_scaled # Alpha channel set to mask
+                image[1] = topology * sharing_rate_clamped + (1 - topology) * env_scaled
+                image[2] = topology * sharing_rate_clamped + (1 - topology) * env_scaled
+                #image[3] = topology * torch.clamp(mask, 0.3, 1) + (1 - topology) * env_scaled # Alpha channel set to mask
         
             # Render new cell candidates as blue
             if new_cell_candidates is not None:
