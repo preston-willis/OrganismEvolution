@@ -9,16 +9,11 @@ class GPUHandler:
     
     def _setup_device(self):
         """Setup and return the appropriate device"""
-        print(f"PyTorch version: {torch.__version__}")
-        print(f"MPS available: {torch.backends.mps.is_available()}")
-        print(f"CUDA available: {torch.cuda.is_available()}")
         
         if torch.backends.mps.is_available():
             device = torch.device("mps")
-            print("✅ Using Apple Silicon GPU (MPS)")
         elif torch.cuda.is_available():
             device = torch.device("cuda")
-            print("✅ Using CUDA GPU")
         else:
             device = torch.device("cpu")
             print("⚠️ Using CPU")
@@ -31,11 +26,7 @@ class GPUHandler:
         
         try:
             test_tensor = torch.tensor([1, 2, 3], device=self.device)
-            print(f"Test tensor device: {test_tensor.device}")
-            print("✅ PyTorch GPU backend is working!")
         except Exception as e:
-            print(f"GPU setup error: {e}")
-            print("Falling back to CPU")
             self.device = torch.device("cpu")
     
     def get_device(self):
