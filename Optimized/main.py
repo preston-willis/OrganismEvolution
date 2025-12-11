@@ -656,7 +656,7 @@ class Environment:
     def compute_environment(self, topology_matrix, harvested_energy):
         """Modify environment based on organism presence"""
         # Deplete terrain energy by the amount harvested
-        self.terrain = torch.clamp(self.terrain - (harvested_energy * 0.1 * topology_matrix), 0, 1)
+        self.terrain = torch.clamp(self.terrain - (harvested_energy * 0.05 * topology_matrix), 0, 1)
         
         # # Apply terrain boost at organism starting positions
         # positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
@@ -1114,7 +1114,7 @@ class Renderer:
                 image[0] = topology + (1 - topology) * 0.0
                 image[1] = topology * sharing_rate_clamped + (1 - topology) * env_scaled
                 image[2] = topology * sharing_rate_clamped + (1 - topology) * env_scaled
-                #image[3] = topology * torch.clamp(mask, 0.3, 1) + (1 - topology) * env_scaled # Alpha channel set to mask
+                image[3] = topology * torch.clamp(mask, 0.3, 1) + (1 - topology) * env_scaled # Alpha channel set to mask
         
             # Render new cell candidates as blue
             if new_cell_candidates is not None:
