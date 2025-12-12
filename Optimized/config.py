@@ -1,18 +1,18 @@
 # Configuration constants for the organism simulation
 import random
 # World Configuration
-WORLD_SIZE = 118
+WORLD_SIZE = 72
 ORGANISM_COUNT = 1
 
 # Environment Configuration
-ENVIRONMENT_TYPE = 3  # 1 = energy masks, 2 = sine waves, 3 = moving perlin noise
+ENVIRONMENT_TYPE = 2  # 1 = energy masks, 2 = sine waves, 3 = moving perlin noise
 ENV_NOISE_THRESHOLD = 0
 NOISE_SCALE = 0.01
 QUANTIZATION_STEP = 0.01
 NOISE_FREQUENCY_MULTIPLIER = 12
 NOISE_OCTAVES = 6
 NOISE_POWER = 1
-PERLIN_NOISE_SCALE = 0.1  # Base scale for perlin noise
+PERLIN_NOISE_SCALE = 0.05  # Base scale for perlin noise
 PERLIN_TIME_SPEED = 0.005  # Speed of perlin noise animation
 PERLIN_FREQUENCY_VARIATION = 0  # How much frequency varies over time
 PERLIN_AMPLITUDE_VARIATION = 0  # How much amplitude varies over time
@@ -63,5 +63,5 @@ CNN_POPULATION_SIZE = 16
 CNN_MUTATION_RATE = 0.2
 CNN_MUTATION_MAGNITUDE = 0.1
 CNN_TRAINING_EPOCHS = 100
-CNN_TRAINING_MAX_TIME = 50
+CNN_TRAINING_MAX_TIME = 100
 CNN_FITNESS_EARLY_TERMINATION_THRESHOLD = 0.1
