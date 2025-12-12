@@ -1,20 +1,25 @@
 # Configuration constants for the organism simulation
 import random
 # World Configuration
-WORLD_SIZE = 72
+WORLD_SIZE = 118
 ORGANISM_COUNT = 1
 
 # Environment Configuration
+ENVIRONMENT_TYPE = 3  # 1 = energy masks, 2 = sine waves, 3 = moving perlin noise
 ENV_NOISE_THRESHOLD = 0
 NOISE_SCALE = 0.01
 QUANTIZATION_STEP = 0.01
-NOISE_FREQUENCY_MULTIPLIER = 8
+NOISE_FREQUENCY_MULTIPLIER = 12
 NOISE_OCTAVES = 6
 NOISE_POWER = 1
+PERLIN_NOISE_SCALE = 0.1  # Base scale for perlin noise
+PERLIN_TIME_SPEED = 0.005  # Speed of perlin noise animation
+PERLIN_FREQUENCY_VARIATION = 0  # How much frequency varies over time
+PERLIN_AMPLITUDE_VARIATION = 0  # How much amplitude varies over time
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.05
-ENERGY_DECAY = 0.01
+ENERGY_DECAY = 0.001
 # Coefficient for locality-based decay modulation (0 disables effect, 1 full strength)
 ENERGY_DENSITY_DECAY_MODIFIER = 0.0
 # Spawn organism at sine terrain peak by default
@@ -48,14 +53,15 @@ OPENGL_CLEAR_COLOR_A = 1.0
 
 # Performance Configuration
 GPU_CACHE_CLEAR_INTERVAL = 10
+DEVICE_TYPE = "mps"  # Preferred device type: "mps", "cuda", or "cpu" (will fallback if unavailable)
 
 # Debug Configuration
 DEBUG_PRINT_INTERVAL = 10
 
 # CNN Training Configuration
 CNN_POPULATION_SIZE = 16
-CNN_MUTATION_RATE = 0.1
+CNN_MUTATION_RATE = 0.2
 CNN_MUTATION_MAGNITUDE = 0.1
 CNN_TRAINING_EPOCHS = 100
-CNN_TRAINING_MAX_TIME = 200
+CNN_TRAINING_MAX_TIME = 50
 CNN_FITNESS_EARLY_TERMINATION_THRESHOLD = 0.1

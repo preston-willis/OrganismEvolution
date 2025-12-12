@@ -1,4 +1,5 @@
 import torch
+from config import DEVICE_TYPE
 
 class GPUHandler:
     """Handles GPU device selection and management"""
@@ -10,7 +11,11 @@ class GPUHandler:
     def _setup_device(self):
         """Setup and return the appropriate device"""
         
-        if torch.backends.mps.is_available():
+        if DEVICE_TYPE == "mps" and torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif DEVICE_TYPE == "cuda" and torch.cuda.is_available():
+            device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
             device = torch.device("mps")
         elif torch.cuda.is_available():
             device = torch.device("cuda")
@@ -34,8 +39,14 @@ class GPUHandler:
         return self.device
     
     def clear_cache(self):
-        """Clear GPU cache if using MPS"""
-        if self.device.type == 'mps':
+        """Clear GPU cache"""
+        from config import DEVICE_TYPE
+        if self.device.type == DEVICE_TYPE:
+            if DEVICE_TYPE == 'mps':
+                torch.mps.empty_cache()
+            elif DEVICE_TYPE == 'cuda':
+                torch.cuda.empty_cache()
+        elif self.device.type == 'mps':
             torch.mps.empty_cache()
         elif self.device.type == 'cuda':
             torch.cuda.empty_cache()

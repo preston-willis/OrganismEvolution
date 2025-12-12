@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import time
-from noise import pnoise2
+from noise import pnoise2, pnoise3
 from scipy import ndimage
 import torchvision
 import torchvision.transforms as transforms
@@ -297,10 +297,11 @@ _worker_device = None
 def _init_worker(device_str):
     """Initialize worker process with device (called once per worker process)"""
     global _worker_device
+    from config import DEVICE_TYPE
     if device_str.startswith('cuda'):
         _worker_device = torch.device(device_str)
-    elif device_str == 'mps':
-        _worker_device = torch.device('mps')
+    elif device_str == DEVICE_TYPE:
+        _worker_device = torch.device(device_str)
     else:
         _worker_device = torch.device('cpu')
     
@@ -346,7 +347,18 @@ def _evaluate_cnn_worker(args):
     del cnn
     del sim
     gc.collect()
-    if _worker_device.type == 'mps':
+    from config import DEVICE_TYPE
+    if _worker_device.type == DEVICE_TYPE:
+        if DEVICE_TYPE == 'mps':
+            torch.mps.empty_cache()
+        elif DEVICE_TYPE == 'cuda':
+            torch.cuda.empty_cache()
+    elif _worker_device.type == DEVICE_TYPE:
+        if DEVICE_TYPE == 'mps':
+            torch.mps.empty_cache()
+        elif DEVICE_TYPE == 'cuda':
+            torch.cuda.empty_cache()
+    elif _worker_device.type == 'mps':
         torch.mps.empty_cache()
     elif _worker_device.type == 'cuda':
         torch.cuda.empty_cache()
@@ -430,7 +442,18 @@ class CNNEvaluator:
         gc.collect()
         
         # Clear GPU cache in main process after evaluation
-        if self.device.type == 'mps':
+        from config import DEVICE_TYPE
+        if self.device.type == DEVICE_TYPE:
+            if DEVICE_TYPE == 'mps':
+                torch.mps.empty_cache()
+            elif DEVICE_TYPE == 'cuda':
+                torch.cuda.empty_cache()
+        elif self.device.type == DEVICE_TYPE:
+            if DEVICE_TYPE == 'mps':
+                torch.mps.empty_cache()
+            elif DEVICE_TYPE == 'cuda':
+                torch.cuda.empty_cache()
+        elif self.device.type == 'mps':
             torch.mps.empty_cache()
         elif self.device.type == 'cuda':
             torch.cuda.empty_cache()
@@ -609,9 +632,42 @@ class Environment:
         self.world_size = world_size
         self.noise_scale = noise_scale
         self.quantization_step = quantization_step
+        self.environment_type = ENVIRONMENT_TYPE
+        self.time = 0.0  # For moving perlin noise
         self.terrain = self.generate_terrain()
     
     def generate_terrain(self):
+        """Generate terrain based on environment type"""
+        if self.environment_type == 1:
+            # Type 1: Energy masks (static terrain with energy sources)
+            return self._generate_energy_mask_terrain()
+        elif self.environment_type == 2:
+            # Type 2: Sine waves
+            return self._generate_sine_terrain()
+        elif self.environment_type == 3:
+            # Type 3: Moving perlin noise
+            return self._generate_perlin_terrain()
+        else:
+            # Default to sine waves
+            return self._generate_sine_terrain()
+    
+    def _generate_energy_mask_terrain(self):
+        """Generate static terrain with energy masks at starting positions"""
+        terrain = torch.zeros((self.world_size, self.world_size), dtype=torch.float32, device=device)
+        positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
+        if positions.numel() > 0:
+            y_coords, x_coords = positions[:, 1], positions[:, 0]
+            energy_radius = 1
+            circle_mask = torch.zeros((self.world_size, self.world_size), device=device)
+            circle_mask[y_coords, x_coords] = True
+            circle_mask = circle_mask.unsqueeze(0).unsqueeze(0)
+            circle_mask = torch.nn.functional.conv2d(circle_mask, torch.ones((1, 1, 2 * energy_radius + 1, 2 * energy_radius + 1), device=device), padding=energy_radius)
+            circle_mask = circle_mask.squeeze(0).squeeze(0)
+            circle_mask = circle_mask > 0
+            terrain[circle_mask] = STARTING_POSITION_TERRAIN_BOOST
+        return torch.clamp(terrain, 0, 1)
+    
+    def _generate_sine_terrain(self):
         """Generate 2D sine-based terrain"""
         x = torch.arange(self.world_size, dtype=torch.float32, device=device)
         y = torch.arange(self.world_size, dtype=torch.float32, device=device)
@@ -653,39 +709,97 @@ class Environment:
         values = values * dead_mask
         return torch.clamp(values, 0, 1)
     
+    def _generate_perlin_terrain(self):
+        """Generate perlin noise terrain by taking 2D slices of 3D perlin noise through time"""
+        # Use CPU for coordinate generation to avoid GPU memory
+        x = torch.arange(self.world_size, dtype=torch.float32)
+        y = torch.arange(self.world_size, dtype=torch.float32)
+        yy, xx = torch.meshgrid(y, x, indexing='ij')
+        
+        # Convert to numpy for pnoise3 (keep on CPU)
+        xx_np = xx.numpy()
+        yy_np = yy.numpy()
+        
+        # Generate each octave separately with independent time progression
+        noise_values = np.zeros((self.world_size, self.world_size), dtype=np.float32)
+        
+        for octave in range(NOISE_OCTAVES):
+            # Each octave has its own time progression for independent morphing
+            octave_time = self.time * (1.0 + octave * 0.3) + octave * 5.0
+            
+            # Base scale for this octave
+            octave_scale = PERLIN_NOISE_SCALE * (2.0 ** octave)
+            
+            # Generate noise for this octave using 3D perlin noise
+            # Sample 2D slices (x, y) at different time values (z)
+            octave_noise = np.zeros((self.world_size, self.world_size), dtype=np.float32)
+            for i in range(self.world_size):
+                for j in range(self.world_size):
+                    # Sample 3D perlin noise: (x, y, time)
+                    # Time is the Z dimension, creating natural morphing as we move through time
+                    octave_noise[i, j] = pnoise3(
+                        xx_np[i, j] * octave_scale,
+                        yy_np[i, j] * octave_scale,
+                        octave_time,
+                        octaves=1,
+                        base=octave * 10
+                    )
+            
+            # Add this octave with its independent amplitude modulation
+            noise_values += octave_noise / (2.0 ** octave)
+        
+        # Normalize from perlin range to [0, 1]
+        # Perlin noise with multiple octaves typically ranges roughly [-1, 1]
+        values = torch.from_numpy(noise_values).to(device)
+        values = (values + 1.0) * 0.5
+        
+        # Apply power shaping
+        values = torch.pow(values, NOISE_POWER)
+        
+        # Apply dead mask
+        dead_mask = values > ENV_NOISE_THRESHOLD
+        values = values * dead_mask
+        return torch.clamp(values, 0, 1)
+    
     def compute_environment(self, topology_matrix, harvested_energy):
         """Modify environment based on organism presence"""
         # Deplete terrain energy by the amount harvested
         self.terrain = torch.clamp(self.terrain - (harvested_energy * 0.05 * topology_matrix), 0, 1)
         
-        # # Apply terrain boost at organism starting positions
-        # positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
-        # if positions.numel() > 0:
-        #     # Create 4 additional sources 3px away from each original position
-        #     additional_positions = []
-        #     for pos in positions:
-        #         x, y = pos[0].item(), pos[1].item()
-        #         offsets = [(-5, 0), (5, 0), (0, -5), (0, 5)]
-        #         for dx, dy in offsets:
-        #             new_x, new_y = x + dx, y + dy
-        #             if 0 <= new_x < self.world_size and 0 <= new_y < self.world_size:
-        #                 additional_positions.append([new_x, new_y])
-            
-        #     if additional_positions:
-        #         additional_positions_tensor = torch.tensor(additional_positions, dtype=torch.long, device=device)
-        #         all_positions = torch.cat([positions, additional_positions_tensor], dim=0)
-        #     else:
-        #         all_positions = positions
-            
-        #     y_coords, x_coords = all_positions[:, 1], all_positions[:, 0]
-        #     energy_radius = 1
-        #     circle_mask = torch.zeros((self.world_size, self.world_size), device=device)
-        #     circle_mask[y_coords, x_coords] = True
-        #     circle_mask = circle_mask.unsqueeze(0).unsqueeze(0)
-        #     circle_mask = torch.nn.functional.conv2d(circle_mask, torch.ones((1, 1, 2 * energy_radius + 1, 2 * energy_radius + 1), device=device), padding=energy_radius)
-        #     circle_mask = circle_mask.squeeze(0).squeeze(0)
-        #     circle_mask = circle_mask > 0
-        #     self.terrain[circle_mask] = self.terrain[circle_mask] + STARTING_POSITION_TERRAIN_BOOST
+        if self.environment_type == 1:
+            # Type 1: Apply terrain boost at organism starting positions
+            positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
+            if positions.numel() > 0:
+                # Create 4 additional sources 3px away from each original position
+                additional_positions = []
+                for pos in positions:
+                    x, y = pos[0].item(), pos[1].item()
+                    offsets = [(-5, 0), (5, 0), (0, -5), (0, 5)]
+                    for dx, dy in offsets:
+                        new_x, new_y = x + dx, y + dy
+                        if 0 <= new_x < self.world_size and 0 <= new_y < self.world_size:
+                            additional_positions.append([new_x, new_y])
+                
+                if additional_positions:
+                    additional_positions_tensor = torch.tensor(additional_positions, dtype=torch.long, device=device)
+                    all_positions = torch.cat([positions, additional_positions_tensor], dim=0)
+                else:
+                    all_positions = positions
+                
+                y_coords, x_coords = all_positions[:, 1], all_positions[:, 0]
+                energy_radius = 1
+                circle_mask = torch.zeros((self.world_size, self.world_size), device=device)
+                circle_mask[y_coords, x_coords] = True
+                circle_mask = circle_mask.unsqueeze(0).unsqueeze(0)
+                circle_mask = torch.nn.functional.conv2d(circle_mask, torch.ones((1, 1, 2 * energy_radius + 1, 2 * energy_radius + 1), device=device), padding=energy_radius)
+                circle_mask = circle_mask.squeeze(0).squeeze(0)
+                circle_mask = circle_mask > 0
+                self.terrain[circle_mask] = self.terrain[circle_mask] + STARTING_POSITION_TERRAIN_BOOST
+        
+        elif self.environment_type == 3:
+            # Type 3: Update moving perlin noise
+            self.time += PERLIN_TIME_SPEED
+            self.terrain = self._generate_perlin_terrain()
             
 
 class OrganismManager:
@@ -784,9 +898,9 @@ class OrganismManager:
         # Calculate average energy in 3x3 neighborhood for decay scaling
         energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0) + terrain.unsqueeze(0).unsqueeze(0)
         average_energy = torch.nn.functional.conv2d(energy_unsqueezed, torch.ones((1, 1, 3, 3), device=device, dtype=torch.float32), padding=1).squeeze(0).squeeze(0) / 9
-    
+
         # Apply decay with factor proportional to cell's distribution rate and number of 0.0 cells in neighborhood
-        decay_amount = self.sharing_rate_matrix**2 * (1-average_energy) * 0.1
+        decay_amount = self.sharing_rate_matrix**2 * (1-average_energy) * 0.5
         # Apply decay and harvest
         self.energy_matrix = torch.clamp((self.energy_matrix + harvested_energy - decay_amount - ENERGY_DECAY) * self.topology_matrix, 0, 1)
 
@@ -861,7 +975,7 @@ class OrganismManager:
         proportions, sharing_rate_output, hidden_channels_output = self.energy_distribution_cnn(shareable_energy, terrain, self.sharing_rate_matrix, self.hidden_channels, self.rotation_matrix)
         
         # Update sharing_rate_matrix with CNN output (only for cells that exist)
-        self.sharing_rate_matrix += self.sharing_rate_matrix * (1 - self.topology_matrix) + sharing_rate_output/50 * self.topology_matrix
+        self.sharing_rate_matrix += self.sharing_rate_matrix * (1 - self.topology_matrix) + sharing_rate_output/10 * self.topology_matrix
         self.sharing_rate_matrix = torch.clamp(self.sharing_rate_matrix, 0.2, 0.999)
         
         # Update hidden_channels with CNN output (only for cells that exist)
@@ -1114,7 +1228,7 @@ class Renderer:
                 image[0] = topology + (1 - topology) * 0.0
                 image[1] = topology * sharing_rate_clamped + (1 - topology) * env_scaled
                 image[2] = topology * sharing_rate_clamped + (1 - topology) * env_scaled
-                image[3] = topology * torch.clamp(mask, 0.3, 1) + (1 - topology) * env_scaled # Alpha channel set to mask
+                image[3] = topology * torch.clamp(mask, 0.1, 1) + (1 - topology) * env_scaled # Alpha channel set to mask
         
             # Render new cell candidates as blue
             if new_cell_candidates is not None:
@@ -1155,7 +1269,8 @@ class Renderer:
             
         # All processing stays on GPU until the very last step
         # Ensure tensor is on GPU
-        if image_tensor.device.type != 'cuda' and image_tensor.device.type != 'mps':
+        from config import DEVICE_TYPE
+        if image_tensor.device.type != 'cuda' and image_tensor.device.type != DEVICE_TYPE:
             image_tensor = image_tensor.to(device)
         
         # Upscale image tensor by sampling each pixel d times in each dimension
@@ -1255,9 +1370,28 @@ class Simulation:
             system_energy = total_energy + total_terrain
             self.logger.log_tick(self.tick, 0, debug_info, None, None, total_energy, total_terrain, system_energy)
        
-        # Clear GPU cache periodically
+        # Clear GPU cache periodically and more aggressively for perlin noise
         if self.tick % GPU_CACHE_CLEAR_INTERVAL == 0:
             gpu_handler.clear_cache()
+            # Additional cleanup for perlin noise environment
+            if self.environment.environment_type == 3:
+                import gc
+                gc.collect()
+                from config import DEVICE_TYPE
+                if device.type == DEVICE_TYPE:
+                    if DEVICE_TYPE == 'mps':
+                        torch.mps.empty_cache()
+                    elif DEVICE_TYPE == 'cuda':
+                        torch.cuda.empty_cache()
+                elif device.type == DEVICE_TYPE:
+                    if DEVICE_TYPE == 'mps':
+                        torch.mps.empty_cache()
+                    elif DEVICE_TYPE == 'cuda':
+                        torch.cuda.empty_cache()
+                elif device.type == 'mps':
+                    torch.mps.empty_cache()
+                elif device.type == 'cuda':
+                    torch.cuda.empty_cache()
         
         self.tick += 1
 
@@ -1422,10 +1556,11 @@ def main():
     last_frame_time = time.time()
     
     # Global variables for OpenGL callbacks
-    global current_simulation, current_renderer, current_input_handler
+    global current_simulation, current_renderer, current_input_handler, main_args
     current_simulation = simulation
     current_renderer = renderer
     current_input_handler = input_handler
+    main_args = args  # Store args for keyboard callback
     
     def display():
         """OpenGL display callback - only handles rendering when window needs redraw"""
@@ -1441,7 +1576,7 @@ def main():
     
     def keyboard(key, x, y):
         """OpenGL keyboard callback"""
-        global current_renderer, current_simulation
+        global current_renderer, current_simulation, main_args
         
         if key == b'q' or key == 27:  # 'q' or ESC
             glut.glutLeaveMainLoop()
@@ -1458,6 +1593,43 @@ def main():
             else:
                 current_harvest_rate = 0
                 print("Harvest rate disabled: 0")
+        elif key == b'r':
+            # Reload simulation (preserve environment type)
+            print("Reloading simulation...")
+            global current_simulation
+            current_env_type = current_simulation.environment.environment_type
+            current_simulation = Simulation()
+            # Restore environment type
+            current_simulation.environment.environment_type = current_env_type
+            current_simulation.environment.terrain = current_simulation.environment.generate_terrain()
+            if main_args.load:
+                loaded_cnn = load_latest_cnn()
+                if loaded_cnn is not None:
+                    current_simulation.organism_manager.energy_distribution_cnn = loaded_cnn
+                    print("Using loaded model in simulation")
+            print(f"Simulation reloaded (environment type: {current_env_type})")
+        elif key == b'1':
+            # Switch to environment type 1 (energy masks)
+            print("Switching to environment type 1 (energy masks)")
+            import config
+            config.ENVIRONMENT_TYPE = 1
+            current_simulation.environment.environment_type = 1
+            current_simulation.environment.terrain = current_simulation.environment._generate_energy_mask_terrain()
+        elif key == b'2':
+            # Switch to environment type 2 (sine waves)
+            print("Switching to environment type 2 (sine waves)")
+            import config
+            config.ENVIRONMENT_TYPE = 2
+            current_simulation.environment.environment_type = 2
+            current_simulation.environment.terrain = current_simulation.environment._generate_sine_terrain()
+        elif key == b'3':
+            # Switch to environment type 3 (moving perlin noise)
+            print("Switching to environment type 3 (moving perlin noise)")
+            import config
+            config.ENVIRONMENT_TYPE = 3
+            current_simulation.environment.environment_type = 3
+            current_simulation.environment.time = 0.0
+            current_simulation.environment.terrain = current_simulation.environment._generate_perlin_terrain()
     
     # Frame rate control - ONLY for rendering/OpenGL
     rendering_frame_counter = 0
