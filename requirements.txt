@@ -1,0 +1,9 @@
+numpy
+torch
+torchvision
+scipy
+noise
+PyOpenGL
+matplotlib
+psutil
+torchviz

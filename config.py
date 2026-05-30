@@ -13,7 +13,7 @@ NOISE_FREQUENCY_MULTIPLIER = 8
 NOISE_OCTAVES = 6
 NOISE_POWER = 1.2
 # Sine terrain: larger values make center-to-edge exponential falloff gentler
-TERRAIN_RADIAL_DECAY_SCALE = 10
+TERRAIN_RADIAL_DECAY_SCALE = 2
 PERLIN_NOISE_SCALE = 0.05  # Base scale for perlin noise
 PERLIN_TIME_SPEED = 0.005  # Speed of perlin noise animation
 PERLIN_FREQUENCY_VARIATION = 0  # How much frequency varies over time
@@ -21,7 +21,7 @@ PERLIN_AMPLITUDE_VARIATION = 0  # How much amplitude varies over time
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.05
-ENERGY_DECAY = 0.01
+ENERGY_DECAY = 0.002
 # Coefficient for locality-based decay modulation (0 disables effect, 1 full strength)
 ENERGY_DENSITY_DECAY_MODIFIER = 0.0
 # Spawn organism at sine terrain peak by default
@@ -31,7 +31,7 @@ CENTER_Y = WORLD_SIZE // 2
 ORGANISM_POSITIONS = [(CENTER_X, CENTER_Y) for i in range(ORGANISM_COUNT)]
 
 # Reproduction Configuration
-REPRODUCTION_THRESHOLD = 0.1
+REPRODUCTION_THRESHOLD = 0.2
 DEATH_THRESHOLD = 0.05
 
 # Energy Configuration

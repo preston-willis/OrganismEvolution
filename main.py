@@ -979,7 +979,7 @@ class OrganismManager:
         # Decay: sparse organism neighborhood + low local terrain → higher loss
         energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0)
         org_avg = torch.nn.functional.conv2d(energy_unsqueezed, self._org_avg_weight, padding=1).squeeze(0).squeeze(0)
-        decay_amount = ENERGY_DENSITY_DECAY_MODIFIER * self.sharing_rate_matrix**2 * (1.0 - org_avg) * (1.0 - self.terrain)
+        decay_amount = ENERGY_DENSITY_DECAY_MODIFIER * self.sharing_rate_matrix * (1.0 - org_avg) * (1.0 - self.terrain)
         cell_decay = (decay_amount + ENERGY_DECAY) * self.topology_matrix
         energy_after_harvest = self.energy_matrix + harvested_energy
         energy_before_decay = energy_after_harvest * self.topology_matrix
@@ -1056,11 +1056,12 @@ class OrganismManager:
         actual_received = torch.min(energy_incoming, capacity)
         self.pending_birth_energy = actual_received * self.new_cell_candidates.float()
         
-        dest_efficiency = torch.where(
-            energy_incoming > 0,
-            actual_received / energy_incoming,
-            torch.zeros_like(energy_incoming)
-        ) * receiving_mask
+        dest_efficiency = torch.zeros_like(energy_incoming)
+        positive_incoming = energy_incoming > 0
+        dest_efficiency[positive_incoming] = (
+            actual_received[positive_incoming] / energy_incoming[positive_incoming]
+        )
+        dest_efficiency = dest_efficiency * receiving_mask
         
         source_removed = self._compute_source_removed(contributions, dest_efficiency, receiving_mask)
         total_received = actual_received.sum()
@@ -1227,9 +1228,9 @@ class Renderer:
         
         # Add simulation data if available
         if simulation_data:
-            organism_energy = torch.sum(simulation_data['energy']).item()
-            terrain_energy = torch.sum(simulation_data['terrain']).item()
-            pending_energy = torch.sum(simulation_data['pending_birth_energy']).item()
+            organism_energy = torch.nansum(simulation_data['energy']).item()
+            terrain_energy = torch.nansum(simulation_data['terrain']).item()
+            pending_energy = torch.nansum(simulation_data['pending_birth_energy']).item()
             destroyed_energy = simulation_data['destroyed_energy']
             system_energy = organism_energy + terrain_energy + pending_energy + destroyed_energy
             topology_count = torch.sum(simulation_data['topology']).item()
@@ -1293,7 +1294,9 @@ class Renderer:
             image[2] = torch.where(org.bool(), org_b, image[2])
 
             if self.render_mode == "org_energy" and self.org_energy_view_enabled:
-                image[3] = org * torch.clamp(mask, 0.1, 1) + (1 - org) * env_scaled
+                safe_mask = torch.nan_to_num(mask, nan=0.0)
+                env_alpha = torch.clamp(env_scaled, min=0.2)
+                image[3] = org * torch.clamp(safe_mask, 0.1, 1.0) + (1 - org) * env_alpha
         
         return image
     
@@ -1409,37 +1412,24 @@ class Simulation:
     
     def update_simulation(self):
         """Update one simulation tick"""
-                
-        # Compute energy decay and sharing
-        harvested_energy = self.organism_manager.compute_energy(self.environment.terrain)
-        
-        # DISABLE topology expansion (major CPU bottleneck)
-        self.organism_manager.compute_topology()
-        
-        # Compute environment changes
-        self.environment.compute_environment(self.organism_manager.topology_matrix, harvested_energy)
+        with torch.inference_mode():
+            harvested_energy = self.organism_manager.compute_energy(self.environment.terrain)
+            
+            self.organism_manager.compute_topology()
+            
+            self.environment.compute_environment(self.organism_manager.topology_matrix, harvested_energy)
         
         self.logger.update_fps()
        
         if self.enable_debug and self.tick % DEBUG_PRINT_INTERVAL == 0:
             debug_info = self.logger.get_debug_info()
-            # Debug: Log total energy in system and terrain
-            total_energy = torch.sum(self.organism_manager.energy_matrix).item()
-            total_terrain = torch.sum(self.environment.terrain).item()
-            total_pending = torch.sum(self.organism_manager.pending_birth_energy).item()
-            system_energy = total_energy + total_terrain + total_pending + self.organism_manager.destroyed_energy
+            om = self.organism_manager
+            total_energy = torch.nansum(om.energy_matrix).item()
+            total_terrain = torch.nansum(self.environment.terrain).item()
+            total_pending = torch.nansum(om.pending_birth_energy).item()
+            system_energy = total_energy + total_terrain + total_pending + om.destroyed_energy
             self.logger.log_tick(self.tick, 0, debug_info, None, None, total_energy, total_terrain, system_energy)
        
-        # Clear GPU cache periodically (interactive sim only; skipped during training)
-        if self.enable_debug and self.tick % GPU_CACHE_CLEAR_INTERVAL == 0:
-            gpu_handler.clear_cache()
-            if self.environment.environment_type == 3:
-                gc.collect()
-                if device.type == 'mps':
-                    torch.mps.empty_cache()
-                elif device.type == 'cuda':
-                    torch.cuda.empty_cache()
-        
         self.tick += 1
 
         return {
@@ -1796,7 +1786,7 @@ For more details, see config.py
                 mask = torch.zeros((WORLD_SIZE, WORLD_SIZE), device=device)
             else:
                 # Single channel mask for energy
-                mask = torch.clamp(last_sim_data['energy'], 0, 1)
+                mask = torch.nan_to_num(torch.clamp(last_sim_data['energy'], 0, 1), nan=0.0)
             
             image_tensor = current_renderer.render(
                 last_sim_data['terrain'], 
