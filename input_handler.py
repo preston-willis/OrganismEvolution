@@ -13,9 +13,10 @@ class InputHandler:
         """Print control instructions"""
         print(" Organism Simulation - OpenGL GPU Accelerated Rendering")
         print("Controls:")
-        print("  'q' - Quit")
+        print("  ESC - Quit")
         print("  'm' - Toggle render mode (red dots / green dots)")
         print("  'n' - Toggle filters (enabled: organisms, disabled: environment only)")
+        print("  'q' - Toggle hidden channel (green) in cell state view")
         print("  'h' - Toggle harvest rate (enabled: 0.2, disabled: 0)")
         # Training is now started via --train CLI flag
         print("  'r' - Toggle replay mode (show best organism from training)")
