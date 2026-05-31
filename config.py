@@ -11,19 +11,19 @@ NOISE_SCALE = 0.01
 QUANTIZATION_STEP = 0.01
 NOISE_FREQUENCY_MULTIPLIER = 8
 NOISE_OCTAVES = 6
-NOISE_POWER = 1.2
+NOISE_POWER = 4
 # Sine terrain: larger values make center-to-edge exponential falloff gentler
-TERRAIN_RADIAL_DECAY_SCALE = 10
+TERRAIN_RADIAL_DECAY_SCALE = 2
 PERLIN_NOISE_SCALE = 0.05  # Base scale for perlin noise
 PERLIN_TIME_SPEED = 0.005  # Speed of perlin noise animation
+PERLIN_DEAD_THRESHOLD = 0.15  # Perlin values at or below this become zero terrain (dead zones)
 PERLIN_FREQUENCY_VARIATION = 0  # How much frequency varies over time
 PERLIN_AMPLITUDE_VARIATION = 0  # How much amplitude varies over time
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.05
-ENERGY_DECAY = 0.01
-# Coefficient for locality-based decay modulation (0 disables effect, 1 full strength)
-ENERGY_DENSITY_DECAY_MODIFIER = 0.0
+ENERGY_DECAY = 0.02
+
 # Spawn organism at sine terrain peak by default
 # For default NOISE_SCALE = 0.01, NOISE_FREQUENCY_MULTIPLIER = 3, peaks are at multiples of about 8
 CENTER_X = WORLD_SIZE // 2
@@ -33,9 +33,12 @@ ORGANISM_POSITIONS = [(CENTER_X, CENTER_Y) for i in range(ORGANISM_COUNT)]
 # Reproduction Configuration
 REPRODUCTION_THRESHOLD = 0.1
 DEATH_THRESHOLD = 0.05
+MAX_CHILDREN_PER_PARENT = 8
 
 # Energy Configuration
 ENERGY_SHARING_RATE = 1
+SHARING_RATE_ON = 0.9
+SHARING_RATE_OFF = 0.1
 
 # Terrain energy at the organism's starting position
 STARTING_POSITION_TERRAIN_BOOST = 10.0
@@ -59,13 +62,14 @@ DEVICE_TYPE = "mps"  # Preferred device type: "mps", "cuda", or "cpu" (will fall
 
 # Debug Configuration
 DEBUG_PRINT_INTERVAL = 10
+LOG_FILE = "simulation.log"
 
 # CNN Training Configuration
 CNN_POPULATION_SIZE = 16
-CNN_MUTATION_RATE = 0.01
-CNN_MUTATION_MAGNITUDE = 0.01
+CNN_MUTATION_RATE = 0.05
+CNN_MUTATION_MAGNITUDE = 0.1
 CNN_TRAINING_EPOCHS = 100
-CNN_TRAINING_MAX_TIME = 100
+CNN_TRAINING_MAX_TIME = 400
 CNN_FITNESS_EARLY_TERMINATION_THRESHOLD = 0.1
 TRAIN_HEADLESS = True
 TRAIN_WORKER_COUNT = None

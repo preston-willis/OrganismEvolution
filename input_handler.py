@@ -17,6 +17,7 @@ class InputHandler:
         print("  'm' - Toggle render mode (red dots / green dots)")
         print("  'n' - Toggle filters (enabled: organisms, disabled: environment only)")
         print("  'q' - Toggle hidden channel (green) in cell state view")
+        print("  'l' - Toggle simulation.log file output")
         print("  'h' - Toggle harvest rate (enabled: 0.2, disabled: 0)")
         # Training is now started via --train CLI flag
         print("  'r' - Toggle replay mode (show best organism from training)")
