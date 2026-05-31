@@ -1,4 +1,5 @@
 import torch
+import multiprocessing
 from config import DEVICE_TYPE
 
 class GPUHandler:
@@ -27,6 +28,8 @@ class GPUHandler:
     
     def _print_device_info(self):
         """Print device information"""
+        if multiprocessing.current_process().name != "MainProcess":
+            return
         print(f"Using device: {self.device}")
         
         try:

@@ -26,7 +26,7 @@ from main import (
     load_latest_cnn,
 )
 import oriented_conv
-from config import DEATH_THRESHOLD, ENERGY_DECAY, ENERGY_HARVEST_RATE, MAX_CHILDREN_PER_PARENT, REPRODUCTION_THRESHOLD, SHARING_RATE_ON, SHARING_RATE_OFF
+from config import DEATH_THRESHOLD, ENERGY_DECAY, ENERGY_HARVEST_RATE, HARVEST_DEPLETION_SCALE, MAX_CHILDREN_PER_PARENT, NOISE_POWER, REPRODUCTION_THRESHOLD, SHARING_RATE_ON, SHARING_RATE_OFF
 
 device = main_module.device
 SMALL = 12
@@ -271,14 +271,15 @@ class TestEnergyDistributionCNN(unittest.TestCase):
         sums = proportions.sum(dim=(0, 1))
         self.assertTrue(torch.allclose(sums, torch.ones(self.H, self.H, device=device), rtol=1e-4))
 
-    def test_binary_hidden_output(self):
+    def test_sigmoid_hidden_output(self):
         shareable = torch.rand(self.H, self.H, device=device)
         terrain = torch.rand(self.H, self.H, device=device)
         sharing = torch.rand(self.H, self.H, device=device)
         hidden = torch.rand(1, self.H, self.H, device=device)
         rotation = torch.zeros(self.H, self.H, device=device)
         _, hidden_out = self.cnn(shareable, terrain, sharing, hidden, rotation)
-        self.assertTrue(torch.all((hidden_out == 0) | (hidden_out == 1)))
+        self.assertTrue(torch.all(hidden_out >= 0))
+        self.assertTrue(torch.all(hidden_out <= 1))
 
     def test_rotate_proportions_moves_local_north(self):
         H = 8
@@ -307,7 +308,7 @@ class TestEnergyDistributionCNN(unittest.TestCase):
 
 class TestCNNGeneticAlgorithm(unittest.TestCase):
     def setUp(self):
-        self.ga = CNNGeneticAlgorithm(4, 0.5, 0.1, device)
+        self.ga = CNNGeneticAlgorithm(4, device)
 
     def test_reset_fitness(self):
         self.ga.fitness_scores = [1.0, 2.0, 3.0, 4.0]
@@ -326,8 +327,27 @@ class TestCNNGeneticAlgorithm(unittest.TestCase):
         self.ga.crossover(self.ga.subjects[0])
         self.assertTrue(torch.equal(self.ga.subjects[1].cppn.fc1.weight.data, parent_w))
 
+    def test_mutation_from_cohort_variance(self):
+        self.ga.fitness_scores = [1.0, 2.0, 3.0, 4.0]
+        self.ga._set_mutation_from_cohort_variance()
+        scores = torch.tensor([1.0, 2.0, 3.0, 4.0])
+        cohort_var = scores.var(unbiased=False).item()
+        mean_squared = scores.mean().item() ** 2
+        normalized_var = cohort_var / mean_squared
+        expected = 1.0 / (1.0 + normalized_var)
+        self.assertEqual(self.ga.mut_rate, expected)
+        self.assertEqual(self.ga.mut_mag, expected)
+
+    def test_mutation_high_when_cohort_fitness_identical(self):
+        self.ga.fitness_scores = [444.0, 444.0, 444.0, 444.0]
+        self.ga._set_mutation_from_cohort_variance()
+        self.assertEqual(self.ga.mut_rate, 1.0)
+        self.assertEqual(self.ga.mut_mag, 1.0)
+
     def test_mutate_skips_fittest(self):
         self.ga.fittest_index = 0
+        self.ga.mut_rate = 0.5
+        self.ga.mut_mag = 0.1
         before = self.ga.subjects[0].cppn.fc1.weight.data.clone()
         torch.manual_seed(0)
         self.ga.mutate()
@@ -585,7 +605,7 @@ class TestOrganismManagerEnergy(unittest.TestCase):
         self.assertAlmostEqual(self.om.sharing_rate_matrix[y, x].item(), SHARING_RATE_ON, places=5)
         self.assertEqual(self.om.hidden_channels[0, y, x].item(), 1.0)
 
-    def test_low_sharing_cells_keep_hidden_off(self):
+    def test_sharing_rate_tracks_sigmoid_hidden(self):
         y, x = 6, 6
         self.om.topology_matrix.zero_()
         self.om.energy_matrix.zero_()
@@ -594,18 +614,20 @@ class TestOrganismManagerEnergy(unittest.TestCase):
         self.om.topology_matrix[y, x] = 1
         self.om.energy_matrix[y, x] = 0.8
         self.om.sharing_rate_matrix[y, x] = SHARING_RATE_OFF
-        self.om.hidden_channels[0, y, x] = 1.0
+        self.om.hidden_channels[0, y, x] = 0.0
         props = uniform_proportions(SMALL, 1, 1)
-        cnn_hidden = torch.ones(1, SMALL, SMALL, device=device)
+        cnn_hidden = torch.full((1, SMALL, SMALL), 0.75, device=device)
 
-        def sets_hidden_on(shareable, terrain, sharing, hidden, rotation):
+        def sets_hidden(shareable, terrain, sharing, hidden, rotation):
             return props, cnn_hidden
 
         terrain = torch.ones(SMALL, SMALL, device=device)
         with patch("main.ENERGY_DECAY", 0.0):
-            with patch.object(self.om.energy_distribution_cnn, "forward", side_effect=sets_hidden_on):
+            with patch.object(self.om.energy_distribution_cnn, "forward", side_effect=sets_hidden):
                 self.om.compute_energy(terrain)
-        self.assertEqual(self.om.hidden_channels[0, y, x].item(), 0.0)
+        self.assertAlmostEqual(self.om.hidden_channels[0, y, x].item(), 0.75, places=5)
+        expected_sharing = SHARING_RATE_OFF + 0.75 * (SHARING_RATE_ON - SHARING_RATE_OFF)
+        self.assertAlmostEqual(self.om.sharing_rate_matrix[y, x].item(), expected_sharing, places=5)
 
     def test_grandchild_links_to_intermediate_parent(self):
         py, px = 6, 6
@@ -663,20 +685,23 @@ class TestOrganismManagerEnergy(unittest.TestCase):
         if om.new_cell_candidates.any():
             self.assertTrue(torch.all(om.energy_matrix[empty & om.new_cell_candidates] == 0))
 
-    def test_sharing_rate_immutable_during_life(self):
+    def test_sharing_rate_updates_from_sigmoid_hidden(self):
         sim = Simulation(enable_debug=False)
         om = sim.organism_manager
         cy, cx = sim.world_size // 2, sim.world_size // 2
         om.sharing_rate_matrix[cy, cx] = SHARING_RATE_OFF
+        om.hidden_channels[0, cy, cx] = 0.0
         props = uniform_proportions(sim.world_size, 1, 1)
+        cnn_hidden = torch.full((1, sim.world_size, sim.world_size), 0.25, device=device)
 
-        def unchanged_sharing(shareable, terr, sharing, hidden, rotation):
-            return props, hidden
+        def update_hidden(shareable, terr, sharing, hidden, rotation):
+            return props, cnn_hidden
 
-        with patch.object(om.energy_distribution_cnn, "forward", side_effect=unchanged_sharing):
+        with patch.object(om.energy_distribution_cnn, "forward", side_effect=update_hidden):
             for _ in range(20):
                 sim.update_simulation()
-        self.assertAlmostEqual(om.sharing_rate_matrix[cy, cx].item(), SHARING_RATE_OFF, places=5)
+        expected_sharing = SHARING_RATE_OFF + 0.25 * (SHARING_RATE_ON - SHARING_RATE_OFF)
+        self.assertAlmostEqual(om.sharing_rate_matrix[cy, cx].item(), expected_sharing, places=5)
 
     def test_parent_incoming_reads_from_parent_not_candidate(self):
         ring = EnergyDistributionCNN._RING_CIJ
@@ -859,7 +884,7 @@ class TestEnvironment(unittest.TestCase):
         self.assertLess(env.terrain[6, 6].item(), before[6, 6].item())
 
     def test_perlin_compute_environment_depletes_harvest(self):
-        env = Environment(SMALL, 0.01, 0.01)
+        env = Environment(SMALL, 0.01, 0.01, harvest_depletion_scale=HARVEST_DEPLETION_SCALE)
         env.environment_type = 3
         topology = torch.zeros(SMALL, SMALL, device=device)
         topology[6, 6] = 1
@@ -867,7 +892,7 @@ class TestEnvironment(unittest.TestCase):
         harvested[6, 6] = 0.2
         env.compute_environment(topology, harvested)
         fresh = env._generate_perlin_terrain()
-        expected = torch.clamp(fresh - harvested * topology, 0, 1)
+        expected = torch.clamp(fresh - harvested * HARVEST_DEPLETION_SCALE * topology, 0, 1)
         self.assertAlmostEqual(env.terrain[6, 6].item(), expected[6, 6].item(), places=4)
 
     def test_sub_threshold_cells_skip_sharing(self):
@@ -978,10 +1003,13 @@ class TestWorkerHelpers(unittest.TestCase):
         _init_worker(str(device))
         cnn = EnergyDistributionCNN(device)
         cpu_state = {k: v.cpu().clone() for k, v in cnn.state_dict().items()}
-        args = (cpu_state, SMALL, 3, 0, False)
-        fitness, tick_data = _evaluate_cnn_worker(args)
+        args = (cpu_state, SMALL, 3, 0, False, HARVEST_DEPLETION_SCALE)
+        fitness, tick_data, survived_to_end, survival_ticks = _evaluate_cnn_worker(args)
         self.assertIsInstance(fitness, float)
         self.assertEqual(tick_data, [])
+        self.assertIsInstance(survived_to_end, bool)
+        self.assertIsInstance(survival_ticks, int)
+        self.assertGreater(survival_ticks, 0)
 
 
 class TestCNNEvaluator(unittest.TestCase):
@@ -1000,6 +1028,24 @@ class TestCNNEvolutionDriver(unittest.TestCase):
         sim = Simulation(enable_debug=False)
         fitness = driver.evaluate_cnn(cnn, sim)
         self.assertGreaterEqual(fitness, 0.0)
+
+    def test_update_scale_raises_when_bot_exceeds_max_frame(self):
+        driver = CNNEvolutionDriver(SMALL, epochs=1, max_time=200)
+        driver.training_harvest_depletion_scale = 0.1
+        driver._update_training_harvest_depletion_scale([200, 50, 30])
+        self.assertAlmostEqual(driver.training_harvest_depletion_scale, 0.125)
+
+    def test_update_scale_targets_half_max_frame(self):
+        driver = CNNEvolutionDriver(SMALL, epochs=1, max_time=200)
+        driver.training_harvest_depletion_scale = 0.1
+        driver._update_training_harvest_depletion_scale([100, 50, 30])
+        self.assertAlmostEqual(driver.training_harvest_depletion_scale, 0.1)
+
+    def test_update_scale_increases_when_max_bot_lives_too_long(self):
+        driver = CNNEvolutionDriver(SMALL, epochs=1, max_time=200)
+        driver.training_harvest_depletion_scale = 0.1
+        driver._update_training_harvest_depletion_scale([150, 50, 30])
+        self.assertAlmostEqual(driver.training_harvest_depletion_scale, 0.15)
 
 
 class TestThermodynamics(unittest.TestCase):
@@ -1210,7 +1256,7 @@ class TestThermodynamics(unittest.TestCase):
         topology[6, 6] = 1.0
         env.compute_environment(topology, harvested)
         terrain_loss = terrain_before - env.terrain[6, 6].item()
-        self.assertAlmostEqual(terrain_loss, harvest_at_cell, places=4)
+        self.assertAlmostEqual(terrain_loss, harvest_at_cell * env.harvest_depletion_scale, places=4)
 
     def test_no_terrain_organism_energy_non_increasing_from_decay(self):
         sim = Simulation(enable_debug=False)
@@ -1407,7 +1453,7 @@ class TestE2EConservation(unittest.TestCase):
 
     @patch("main.ENERGY_DECAY", 0.0)
     def test_per_tick_system_energy_conserved_without_decay(self):
-        sim = Simulation(enable_debug=False)
+        sim = Simulation(enable_debug=False, harvest_depletion_scale=1.0)
         sim.environment.environment_type = 2
         om = sim.organism_manager
         cy, cx = sim.world_size // 2, sim.world_size // 2

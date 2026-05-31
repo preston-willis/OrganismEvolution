@@ -132,7 +132,6 @@ class Logger:
         print(f"  FPS: {fps:.1f}")
         print(f"  Memory: {debug_info['memory_mb']:.1f}MB")
         print(f"  CPU: {debug_info['cpu_percent']:.1f}%")
-        print(f"  GPU: {debug_info['gpu_memory']}")
         if topology_info is not None:
             print(f"  {topology_info}")
         if energy_levels is not None:

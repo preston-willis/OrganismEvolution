@@ -36,6 +36,15 @@ device = gpu_handler.get_device()
 # Global harvest rate (can be modified at runtime)
 current_harvest_rate = ENERGY_HARVEST_RATE
 
+_pnoise3_vectorizers = {}
+
+
+def _pnoise3_grid(xx, yy, z, base):
+    if base not in _pnoise3_vectorizers:
+        fn = partial(pnoise3, octaves=1, base=base)
+        _pnoise3_vectorizers[base] = np.vectorize(fn, otypes=[np.float32])
+    return _pnoise3_vectorizers[base](xx, yy, z)
+
 # Global best CNN for replay
 current_best_cnn = None
 replay_mode = False
@@ -198,17 +207,17 @@ class EnergyDistributionCNN(torch.nn.Module):
         proportions = proportions_flat.view(3, 3, world_size, world_size)
         proportions = self._rotate_proportions_8way(proportions, rotation_matrix)
         
-        hidden_channels_output = (torch.sigmoid(hidden_channels_output) > 0.5).float()  # (1, H, W)
+        hidden_channels_output = torch.sigmoid(hidden_channels_output)  # (1, H, W)
         
         return proportions, hidden_channels_output
 
 
 class CNNGeneticAlgorithm:
     """Genetic algorithm for training CNN weights with GPU evaluation"""
-    def __init__(self, pop_size, mut_rate, mut_mag, device):
+    def __init__(self, pop_size, device):
         self.pop_size = pop_size
-        self.mut_rate = mut_rate
-        self.mut_mag = mut_mag
+        self.mut_rate = 0.0
+        self.mut_mag = 0.0
         self.device = device
         self.fittest_index = 0
         self.run_id = str(uuid.uuid1())[:4]
@@ -231,6 +240,7 @@ class CNNGeneticAlgorithm:
             
         # Crossover and mutation
         self.crossover(self.subjects[self.fittest_index])
+        self._set_mutation_from_cohort_variance()
         self.mutate()
         
     def calc_fittest(self):
@@ -259,6 +269,18 @@ class CNNGeneticAlgorithm:
                 self.subjects[i].conv1.weight.data = self.subjects[i].cppn.generate_conv_weights(4, 32, 3)
                 self.subjects[i].conv1.bias.data = self.subjects[i].cppn.generate_bias(32)
                 self.subjects[i]._regenerate_conv2_from_cppn()
+
+    def _set_mutation_from_cohort_variance(self):
+        scores = torch.tensor(self.fitness_scores, dtype=torch.float32)
+        cohort_var = scores.var(unbiased=False).item()
+        mean_squared = scores.mean().item() ** 2
+        if mean_squared == 0:
+            normalized_var = 0.0
+        else:
+            normalized_var = cohort_var / mean_squared
+        mutation_strength = 1.0 / (1.0 + normalized_var)
+        self.mut_rate = mutation_strength
+        self.mut_mag = mutation_strength
                 
     def mutate(self):
         """Apply mutations to all subjects except the fittest"""
@@ -346,9 +368,15 @@ def _release_device_memory(torch_device):
     elif torch_device.type == 'cuda':
         torch.cuda.empty_cache()
 
+def _sharing_rate_from_hidden(hidden):
+    return SHARING_RATE_OFF + hidden * (SHARING_RATE_ON - SHARING_RATE_OFF)
+
+def _compute_simulation_fitness(total_cell_count):
+    return total_cell_count
+
 def _evaluate_cnn_worker(args):
     """Worker function for multiprocessing CNN evaluation"""
-    cnn_state_dict, world_size, max_time, bot_index, collect_tick_data = args
+    cnn_state_dict, world_size, max_time, bot_index, collect_tick_data, harvest_depletion_scale = args
     
     # Use the device that was set during worker initialization
     global _worker_device
@@ -358,14 +386,17 @@ def _evaluate_cnn_worker(args):
     cnn.load_state_dict(cnn_state_dict)
     
     # Create simulation instance
-    sim = Simulation(enable_debug=False, enable_log=False)
+    sim = Simulation(enable_debug=False, enable_log=False, harvest_depletion_scale=harvest_depletion_scale)
     sim.organism_manager.energy_distribution_cnn = cnn
     
     # Evaluate CNN
     total_cell_count = 0.0
     tick_data = []
+    survived_to_end = False
+    survival_ticks = 0
     for t in range(max_time):
         sim.update_simulation()
+        survival_ticks = t + 1
         current_cell_count = torch.sum(sim.organism_manager.topology_matrix).item()
         total_cell_count += current_cell_count
         
@@ -378,13 +409,20 @@ def _evaluate_cnn_worker(args):
         
         if current_cell_count == 0:
             break
+    else:
+        survived_to_end = True
     
     # Explicitly clean up GPU memory
     del cnn
     del sim
     _release_device_memory(_worker_device)
     
-    return (total_cell_count, tick_data)
+    return (
+        _compute_simulation_fitness(total_cell_count),
+        tick_data,
+        survived_to_end,
+        survival_ticks,
+    )
 
 
 class CNNEvaluator:
@@ -430,7 +468,7 @@ class CNNEvaluator:
         """Ensure pool is cleaned up on deletion"""
         self.close_pool()
         
-    def evaluate_population(self, subjects, pop_size):
+    def evaluate_population(self, subjects, pop_size, harvest_depletion_scale):
         """Evaluate entire population using multiprocessing"""
         # Ensure pool is created (reused across generations)
         self._ensure_pool()
@@ -442,16 +480,21 @@ class CNNEvaluator:
         for i in range(pop_size):
             state_dict = subjects[i].state_dict()
             cpu_state_dict = {k: v.cpu().clone() for k, v in state_dict.items()}
-            args_list.append((cpu_state_dict, self.world_size, self.max_time, i, collect_tick_data))
+            args_list.append((cpu_state_dict, self.world_size, self.max_time, i, collect_tick_data, harvest_depletion_scale))
         
         # Use multiprocessing to evaluate in parallel (reuse existing pool)
         results = self.pool.map(_evaluate_cnn_worker, args_list)
         
         # Extract fitness scores and process tick data
         fitness_scores = []
+        survival_ticks = []
+        any_survived_to_end = False
         if self.grapher is not None:
-            for i, (fitness, tick_data) in enumerate(results):
+            for i, (fitness, tick_data, survived_to_end, ticks) in enumerate(results):
                 fitness_scores.append(fitness)
+                survival_ticks.append(ticks)
+                if survived_to_end:
+                    any_survived_to_end = True
                 # Process tick data for grapher
                 for t, total_cell_count, current_cell_count, org_energy, env_energy, total in tick_data:
                     self.grapher.enqueue_tick(t, self.current_generation_max_fitness, [total_cell_count], org_energy, env_energy, total)
@@ -462,14 +505,16 @@ class CNNEvaluator:
                 except Exception:
                     pass
         else:
-            fitness_scores = [fitness for fitness, _ in results]
+            fitness_scores = [fitness for fitness, _, _, _ in results]
+            survival_ticks = [ticks for _, _, _, ticks in results]
+            any_survived_to_end = any(survived for _, _, survived, _ in results)
         
         # Clean up to free memory
         del args_list
         del results
         _release_device_memory(self.device)
         
-        return fitness_scores
+        return fitness_scores, survival_ticks, any_survived_to_end
     
     def _evaluate_single_cnn(self, simulation, bot_index: int | None = None):
         """Evaluate a single CNN simulation"""
@@ -479,7 +524,6 @@ class CNNEvaluator:
         for t in range(self.max_time):
             sim_data = simulation.update_simulation()
             
-            # Calculate fitness based on total cell count
             current_cell_count = torch.sum(simulation.organism_manager.topology_matrix).item()
             total_cell_count += current_cell_count
 
@@ -500,8 +544,7 @@ class CNNEvaluator:
             if current_cell_count == 0:
                 break
                 
-        # Fitness is total accumulated cell count over time (rewards high cell count sustained longer)
-        fitness = total_cell_count
+        fitness = _compute_simulation_fitness(total_cell_count)
         return fitness
 
 
@@ -513,19 +556,50 @@ class CNNEvolutionDriver:
         self.max_time = max_time
         
         # Genetic algorithm parameters
-        self.ga = CNNGeneticAlgorithm(CNN_POPULATION_SIZE, CNN_MUTATION_RATE, CNN_MUTATION_MAGNITUDE, device)
+        self.ga = CNNGeneticAlgorithm(CNN_POPULATION_SIZE, device)
         
         # Evaluator
         self.evaluator = CNNEvaluator(world_size, max_time, device)
         self.grapher = None
+        self.training_harvest_depletion_scale = HARVEST_DEPLETION_SCALE
         
         # Replay simulation for showing best organism
         self.replay_simulation = None
+
+    def _update_training_harvest_depletion_scale(self, survival_ticks):
+        any_survived_to_end = any(ticks >= self.max_time for ticks in survival_ticks)
+        if any_survived_to_end:
+            self.training_harvest_depletion_scale *= 1.25
+            print(
+                f"At least one bot exceeded max frame {self.max_time}; "
+                f"raising harvest depletion scale by 25% to {self.training_harvest_depletion_scale:.6f}"
+            )
+            return
+
+        if len(survival_ticks) == 0:
+            return
+
+        max_survival = max(survival_ticks)
+        if max_survival == 0:
+            return
+
+        target_ticks = self.max_time * 0.5
+        ratio = max_survival / target_ticks
+        self.training_harvest_depletion_scale *= ratio
+        print(
+            f"Longest bot survived {max_survival}/{self.max_time} frames "
+            f"(target {target_ticks:.0f}); "
+            f"adjusting harvest depletion scale to {self.training_harvest_depletion_scale:.6f}"
+        )
         
     def evaluate_cnn(self, cnn, simulation):
         """Evaluate a CNN by running simulation and measuring fitness"""
         # Create a copy of simulation with this CNN (debug disabled during training)
-        test_sim = Simulation(enable_debug=False, enable_log=False)
+        test_sim = Simulation(
+            enable_debug=False,
+            enable_log=False,
+            harvest_depletion_scale=self.training_harvest_depletion_scale,
+        )
         test_sim.organism_manager.energy_distribution_cnn = cnn
         
         total_cell_count = 0.0
@@ -534,7 +608,6 @@ class CNNEvolutionDriver:
         for t in range(self.max_time):
             sim_data = test_sim.update_simulation()
             
-            # Calculate fitness based on total cell count
             current_cell_count = torch.sum(test_sim.organism_manager.topology_matrix).item()
             total_cell_count += current_cell_count
             
@@ -542,8 +615,7 @@ class CNNEvolutionDriver:
             if current_cell_count == 0:
                 break
                 
-        # Fitness is total accumulated cell count over time
-        fitness = total_cell_count
+        fitness = _compute_simulation_fitness(total_cell_count)
         return fitness
     
     def create_replay_simulation(self, best_cnn):
@@ -551,7 +623,9 @@ class CNNEvolutionDriver:
         global current_best_cnn, replay_mode
         
         # Create new simulation with the best CNN
-        self.replay_simulation = Simulation()
+        self.replay_simulation = Simulation(
+            harvest_depletion_scale=self.training_harvest_depletion_scale,
+        )
         self.replay_simulation.organism_manager.energy_distribution_cnn = best_cnn
         
         # Update global variables
@@ -565,7 +639,7 @@ class CNNEvolutionDriver:
             except Exception:
                 pass
         
-        print(f"Created replay simulation with best CNN (fitness/cell count: {self.ga.fitness_scores[self.ga.fittest_index]:.6f})")
+        print(f"Created replay simulation with best CNN (fitness: {self.ga.fitness_scores[self.ga.fittest_index]:.6f})")
         print("Press 'r' to toggle replay mode and see the best organism in action!")
         
     def run_evolution(self):
@@ -577,14 +651,16 @@ class CNNEvolutionDriver:
         try:
             for gen in range(self.epochs):
                 print(f"\nGeneration {gen + 1}/{self.epochs}")
+                print(f"Training harvest depletion scale: {self.training_harvest_depletion_scale:.6f}")
                 
                 # Evaluate entire population sequentially
                 print("Evaluating population...")
                 if self.grapher is not None:
                     self.evaluator.grapher = self.grapher
-                fitness_scores = self.evaluator.evaluate_population(
+                fitness_scores, survival_ticks, _ = self.evaluator.evaluate_population(
                     self.ga.subjects, 
-                    CNN_POPULATION_SIZE
+                    CNN_POPULATION_SIZE,
+                    self.training_harvest_depletion_scale,
                 )
                 
                 # Update fitness scores
@@ -592,16 +668,16 @@ class CNNEvolutionDriver:
                 
                 # Print individual results
                 for i, fitness in enumerate(fitness_scores):
-                    print(f"CNN {i}: fitness (cell count) = {fitness:.6f}")
+                    print(f"CNN {i}: fitness = {fitness:.6f}")
                     
                 # Run one generation
                 self.ga.compute_generation()
+                print(f"Mutation rate: {self.ga.mut_rate:.6f}")
+                print(f"Mutation magnitude: {self.ga.mut_mag:.6f}")
                 
                 # Print summary
                 best_fitness = self.ga.fitness_scores[self.ga.fittest_index]
-                print(f"Best fitness (cell count): {best_fitness:.6f}")
-                print(f"Best CNN conv1 weight shape: {self.ga.subjects[self.ga.fittest_index].conv1.weight.data.shape}")
-                print(f"Best CNN conv2 weight shape: {self.ga.subjects[self.ga.fittest_index].conv2.weight.data.shape}")
+                print(f"Best fitness: {best_fitness:.6f}")
                 
                 # Save the fittest network every generation
                 self.ga.save_model(self.ga.fittest_index, generation=gen + 1)
@@ -625,6 +701,8 @@ class CNNEvolutionDriver:
                     # Clear tick-series for next generation window
                     self.grapher.reset_tick_metrics()
                 
+                self._update_training_harvest_depletion_scale(survival_ticks)
+                
                 # Reset for next generation
                 self.ga.reset_fitness()
         finally:
@@ -636,12 +714,19 @@ class CNNEvolutionDriver:
 
 
 class Environment:
-    def __init__(self, world_size, noise_scale, quantization_step):
+    def __init__(self, world_size, noise_scale, quantization_step, harvest_depletion_scale=None):
         self.world_size = world_size
         self.noise_scale = noise_scale
         self.quantization_step = quantization_step
+        self.noise_power = NOISE_POWER
         self.environment_type = ENVIRONMENT_TYPE
+        if harvest_depletion_scale is None:
+            self.harvest_depletion_scale = HARVEST_DEPLETION_SCALE
+        else:
+            self.harvest_depletion_scale = harvest_depletion_scale
         self.time = 0.0  # For moving perlin noise
+        self._perlin_xx = None
+        self._perlin_yy = None
         self.terrain = self.generate_terrain()
     
     def generate_terrain(self):
@@ -692,7 +777,7 @@ class Environment:
         # Normalize to 0-1 (cosine ranges from -1 to 1)
         values = (values + 1.0) * 0.5
         # Shape distribution using power
-        values = torch.pow(values, NOISE_POWER)
+        values = torch.pow(values, self.noise_power)
         # Apply radial decay
         values = values * radial_decay
         
@@ -709,7 +794,7 @@ class Environment:
             source_values = torch.cos((xx - sx) * freq) * torch.cos((yy - sy) * freq)
             source_values = (source_values + 1.0) * 0.5
             # Apply same shaping and radial decay to source peaks
-            source_values = torch.pow(source_values, NOISE_POWER) * (radial_decay**2)
+            source_values = torch.pow(source_values, self.noise_power) * (radial_decay**2)
             values = torch.maximum(values, source_values)
         
         # Apply dead mask similar to previous behavior
@@ -717,50 +802,38 @@ class Environment:
         values = values * dead_mask
         return torch.clamp(values, 0, 1)
     
+    def _ensure_perlin_coords(self):
+        if self._perlin_xx is None or self._perlin_xx.shape[0] != self.world_size:
+            x = torch.arange(self.world_size, dtype=torch.float32)
+            y = torch.arange(self.world_size, dtype=torch.float32)
+            yy, xx = torch.meshgrid(y, x, indexing='ij')
+            self._perlin_xx = xx.numpy()
+            self._perlin_yy = yy.numpy()
+
     def _generate_perlin_terrain(self):
         """Generate perlin noise terrain by taking 2D slices of 3D perlin noise through time"""
-        # Use CPU for coordinate generation to avoid GPU memory
-        x = torch.arange(self.world_size, dtype=torch.float32)
-        y = torch.arange(self.world_size, dtype=torch.float32)
-        yy, xx = torch.meshgrid(y, x, indexing='ij')
-        
-        # Convert to numpy for pnoise3 (keep on CPU)
-        xx_np = xx.numpy()
-        yy_np = yy.numpy()
-        
-        # Generate each octave separately with independent time progression
+        self._ensure_perlin_coords()
+        xx_np = self._perlin_xx
+        yy_np = self._perlin_yy
+
         noise_values = np.zeros((self.world_size, self.world_size), dtype=np.float32)
-        
+
         for octave in range(NOISE_OCTAVES):
-            # Each octave has its own time progression for independent morphing
             octave_time = self.time * (1.0 + octave * 0.3) + octave * 5.0
-            
-            # Base scale for this octave
             octave_scale = PERLIN_NOISE_SCALE * (2.0 ** octave)
-            
-            # Generate noise for this octave using 3D perlin noise
-            # Sample 2D slices (x, y) at different time values (z)
-            octave_noise = np.zeros((self.world_size, self.world_size), dtype=np.float32)
-            for i in range(self.world_size):
-                for j in range(self.world_size):
-                    # Sample 3D perlin noise: (x, y, time)
-                    # Time is the Z dimension, creating natural morphing as we move through time
-                    octave_noise[i, j] = pnoise3(
-                        xx_np[i, j] * octave_scale,
-                        yy_np[i, j] * octave_scale,
-                        octave_time,
-                        octaves=1,
-                        base=octave * 10
-                    )
-            
-            # Add this octave with its independent amplitude modulation
+            octave_noise = _pnoise3_grid(
+                xx_np * octave_scale,
+                yy_np * octave_scale,
+                octave_time,
+                octave * 10,
+            )
             noise_values += octave_noise / (2.0 ** octave)
         
         # Octaves can sum slightly outside [-1, 1]; negative normalized values break pow(NOISE_POWER)
         noise_values = np.clip(noise_values, -1.0, 1.0)
         values = torch.from_numpy(noise_values).to(device)
         values = torch.clamp((values + 1.0) * 0.5, 0.0, 1.0)
-        values = torch.pow(values, NOISE_POWER)
+        values = torch.pow(values, self.noise_power)
         
         # Apply dead mask
         dead_mask = values > ENV_NOISE_THRESHOLD
@@ -779,12 +852,13 @@ class Environment:
             # Perlin terrain regenerates each tick; deplete by harvest for energy conservation
             self.time += PERLIN_TIME_SPEED
             self.terrain.copy_(self._generate_perlin_terrain())
-            self.terrain.copy_(torch.clamp(self.terrain - (harvested_energy * topology_matrix), 0, 1))
+
+        depletion = harvested_energy * self.harvest_depletion_scale * topology_matrix
+        self.terrain.copy_(torch.clamp(self.terrain - depletion, 0, 1))
+        
+        if self.environment_type == 3:
             return
 
-        # Deplete terrain by the amount organisms harvested
-        self.terrain.copy_(torch.clamp(self.terrain - (harvested_energy * topology_matrix), 0, 1))
-        
         if self.environment_type == 1:
             # Type 1: Apply terrain boost at organism starting positions
             positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
@@ -836,6 +910,7 @@ class OrganismManager:
         self._has_new_cell_candidates = False
         self.new_cell_contributions = None
         self._birth_events = []
+        self.record_birth_events = False
         self._initialize_topology()
         
         # Reproduction parameters
@@ -1071,27 +1146,26 @@ class OrganismManager:
         child_count = self._compute_living_child_count()
         _, parent_y, parent_x = self._dominant_giver_dir_at_sites(birth_mask, contrib_by_giver_dir)
         birth_y, birth_x = birth_mask.nonzero(as_tuple=True)
-        order = torch.argsort(self.pending_birth_energy[birth_y, birth_x], descending=True)
+        n = birth_y.shape[0]
+        if n == 0:
+            return birth_mask
+        pending_at = self.pending_birth_energy[birth_y, birth_x]
+        py_at = parent_y[birth_y, birth_x]
+        px_at = parent_x[birth_y, birth_x]
+        parent_idx = py_at * self.world_size + px_at
+        slots = (MAX_CHILDREN_PER_PARENT - child_count[py_at, px_at]).clamp(min=0)
+        scale = pending_at.max() + 1.0
+        order = torch.argsort(parent_idx.float() * scale - pending_at)
         birth_y = birth_y[order]
         birth_x = birth_x[order]
-        parent_y_at = parent_y[birth_y, birth_x].tolist()
-        parent_x_at = parent_x[birth_y, birth_x].tolist()
-        birth_y_list = birth_y.tolist()
-        birth_x_list = birth_x.tolist()
-        temp = child_count.cpu().tolist()
+        parent_idx_sorted = parent_idx[order]
+        slots_sorted = slots[order]
+        rank = torch.zeros(n, device=device, dtype=torch.long)
+        for i in range(1, n):
+            if parent_idx_sorted[i] == parent_idx_sorted[i - 1]:
+                rank[i] = rank[i - 1] + 1
         allowed = torch.zeros_like(birth_mask)
-        allowed_flags = []
-        for i in range(len(birth_y_list)):
-            y = birth_y_list[i]
-            x = birth_x_list[i]
-            py = parent_y_at[i]
-            px = parent_x_at[i]
-            if temp[py][px] < MAX_CHILDREN_PER_PARENT:
-                allowed_flags.append(True)
-                temp[py][px] += 1
-            else:
-                allowed_flags.append(False)
-        allowed[birth_y, birth_x] = torch.tensor(allowed_flags, dtype=torch.bool, device=device)
+        allowed[birth_y, birth_x] = rank < slots_sorted
         return allowed
 
     def _initialize_topology(self):
@@ -1100,9 +1174,9 @@ class OrganismManager:
             y_coords, x_coords = self.positions[:, 1], self.positions[:, 0]
             self.topology_matrix[y_coords, x_coords] = 1
             self.energy_matrix[y_coords, x_coords] = 1
-            seed_sharing_rate = SHARING_RATE_ON if ENERGY_SHARING_RATE > 0 else SHARING_RATE_OFF
-            self.sharing_rate_matrix[y_coords, x_coords] = seed_sharing_rate
-            self.hidden_channels[:, y_coords, x_coords] = 0
+            seed_hidden = 1.0 if ENERGY_SHARING_RATE > 0 else 0.0
+            self.hidden_channels[:, y_coords, x_coords] = seed_hidden
+            self.sharing_rate_matrix[y_coords, x_coords] = _sharing_rate_from_hidden(seed_hidden)
             self.rotation_matrix[y_coords, x_coords] = 0
             self.parent_giver_dir[y_coords, x_coords] = 0
     
@@ -1114,35 +1188,40 @@ class OrganismManager:
         snapped_angles = rotation_bucket.float() * (torch.pi / 4)
         self.rotation_matrix[birth_mask] = snapped_angles[birth_mask]
         giver_hidden = self.hidden_channels[0, parent_y, parent_x]
-        child_rate = SHARING_RATE_OFF + giver_hidden * (SHARING_RATE_ON - SHARING_RATE_OFF)
-        self.sharing_rate_matrix[birth_mask] = child_rate[birth_mask]
         self.hidden_channels[0, birth_mask] = giver_hidden[birth_mask]
+        self.sharing_rate_matrix[birth_mask] = _sharing_rate_from_hidden(giver_hidden)[birth_mask]
 
     def _record_birth_events(self, birth_mask, contrib_by_giver_dir=None):
         if not birth_mask.any():
             return
         _, parent_y, parent_x = self._dominant_giver_dir_at_sites(birth_mask, contrib_by_giver_dir)
         birth_y, birth_x = birth_mask.nonzero(as_tuple=True)
-        for i in range(len(birth_y)):
-            y = birth_y[i].item()
-            x = birth_x[i].item()
-            py = parent_y[y, x].item()
-            px = parent_x[y, x].item()
-            parent_living = self.topology_matrix[py, px].item() > 0
-            parent_hidden = self.hidden_channels[0, py, px].item()
-            parent_sharing = self.sharing_rate_matrix[py, px].item()
+        py = parent_y[birth_y, birth_x]
+        px = parent_x[birth_y, birth_x]
+        parent_living = self.topology_matrix[py, px] > 0
+        parent_hidden = self.hidden_channels[0, py, px]
+        parent_sharing = self.sharing_rate_matrix[py, px]
+        child_sharing = self.sharing_rate_matrix[birth_y, birth_x]
+        birth_energy = self.pending_birth_energy[birth_y, birth_x]
+        giver_weight_sum = self.pending_giver_contrib[:, birth_y, birth_x].sum(dim=0)
+        parent_dir = self.parent_giver_dir[birth_y, birth_x]
+        batch = torch.stack([
+            birth_y.float(), birth_x.float(), parent_dir.float(), py.float(), px.float(),
+            parent_living.float(), parent_hidden, parent_sharing, child_sharing, birth_energy, giver_weight_sum,
+        ], dim=1).cpu()
+        for row in batch.tolist():
             self._birth_events.append({
-                "y": y,
-                "x": x,
-                "parent_dir": self.parent_giver_dir[y, x].item(),
-                "parent_y": py,
-                "parent_x": px,
-                "parent_living": int(parent_living),
-                "parent_hidden": parent_hidden,
-                "parent_sharing": parent_sharing,
-                "child_sharing": self.sharing_rate_matrix[y, x].item(),
-                "birth_energy": self.pending_birth_energy[y, x].item(),
-                "giver_weight_sum": self.pending_giver_contrib[:, y, x].sum().item(),
+                "y": int(row[0]),
+                "x": int(row[1]),
+                "parent_dir": int(row[2]),
+                "parent_y": int(row[3]),
+                "parent_x": int(row[4]),
+                "parent_living": int(row[5]),
+                "parent_hidden": row[6],
+                "parent_sharing": row[7],
+                "child_sharing": row[8],
+                "birth_energy": row[9],
+                "giver_weight_sum": row[10],
             })
     
     def compute_topology(self):
@@ -1150,13 +1229,13 @@ class OrganismManager:
         ready_to_birth = (self.topology_matrix == 0) & (
             self.pending_birth_energy >= self.reproduction_threshold
         )
-        if not ready_to_birth.any() and not self._has_new_cell_candidates and not self.new_cell_candidates.any():
+        if not ready_to_birth.any() and not self._has_new_cell_candidates:
             if (self.pending_birth_energy > 0).any():
                 self._return_orphaned_pending_to_sources()
             self.energy_matrix = torch.nan_to_num(self.energy_matrix, nan=0.0, posinf=1.0, neginf=0.0)
             self.energy_matrix = torch.clamp(self.energy_matrix, 0, 1) * self.topology_matrix
             return
-        if ready_to_birth.any() or self._has_new_cell_candidates or self.new_cell_candidates.any():
+        if ready_to_birth.any() or self._has_new_cell_candidates:
             self._has_new_cell_candidates = False
             
             contrib_by_giver_dir = None
@@ -1172,7 +1251,8 @@ class OrganismManager:
                 energy_mask = allowed
             if energy_mask.any():
                 self._assign_birth_parent_state(energy_mask, contrib_by_giver_dir)
-                self._record_birth_events(energy_mask, contrib_by_giver_dir)
+                if self.record_birth_events:
+                    self._record_birth_events(energy_mask, contrib_by_giver_dir)
             
             # Add selected positions to topology and commit birth energy
             self.topology_matrix[energy_mask] = 1
@@ -1184,12 +1264,17 @@ class OrganismManager:
         self.energy_matrix = torch.nan_to_num(self.energy_matrix, nan=0.0, posinf=1.0, neginf=0.0)
         self.energy_matrix = torch.clamp(self.energy_matrix, 0, 1) * self.topology_matrix
     
-    def _remove_dead_cells(self):
-        """Clear topology and cell state where energy is below death threshold"""
+    def _dead_cell_mask(self):
         living = self.topology_matrix > 0
-        low_energy_mask = living & (
+        return living & (
             (self.energy_matrix <= DEATH_THRESHOLD) | ~torch.isfinite(self.energy_matrix)
         )
+
+    def _remove_dead_cells(self):
+        """Clear topology and cell state where energy is below death threshold"""
+        low_energy_mask = self._dead_cell_mask()
+        if not low_energy_mask.any():
+            return
         death_energy = self.energy_matrix * low_energy_mask.float()
         unplaced = self._spread_energy_to_living_neighbors(death_energy)
         self._add_destroyed(unplaced)
@@ -1208,7 +1293,7 @@ class OrganismManager:
         
         harvested_energy = torch.minimum(local_terrain, self.sharing_rate_matrix * ENERGY_HARVEST_RATE)
         
-        energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0) + local_terrain.unsqueeze(0).unsqueeze(0)
+        energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0)
         average_energy = torch.nn.functional.conv2d(
             energy_unsqueezed,
             torch.ones((1, 1, 3, 3), device=device, dtype=torch.float32),
@@ -1219,12 +1304,12 @@ class OrganismManager:
         energy_after_harvest = self.energy_matrix + harvested_energy
         energy_before_decay = energy_after_harvest * self.topology_matrix
         self.energy_matrix = torch.clamp(
-            (energy_after_harvest - decay_amount * ENERGY_DECAY-0.01) * self.topology_matrix,
+            (energy_after_harvest - decay_amount * ENERGY_DECAY-0.005) * self.topology_matrix,
             0,
             1,
         )
         self._add_destroyed(energy_before_decay - self.energy_matrix)
-
+        self._remove_dead_cells()
         return harvested_energy
     
     def _compute_energy_contributions(self, shareable_energy, proportions):
@@ -1267,23 +1352,28 @@ class OrganismManager:
         """Main energy computation: harvest, decay, and sharing"""
         self._tick_destroyed.zero_()
         harvested_energy = self._apply_harvest_and_decay(terrain)
-        self._remove_dead_cells()
         
         # Shareable outbound energy (new tensor; energy_matrix is updated later in sharing)
         shareable_energy = self.energy_matrix * self.topology_matrix * self.sharing_rate_matrix
         
-        # Get 3x3 proportions and hidden_channels output from CNN; sharing_rate is fixed at birth
-        proportions, hidden_channels_output = self.energy_distribution_cnn(
-            shareable_energy, terrain, self.sharing_rate_matrix, self.hidden_channels, self.rotation_matrix
-        )
-        
-        topology_mask = self.topology_matrix
-        self.hidden_channels = self.hidden_channels * (1 - topology_mask.unsqueeze(0)) + hidden_channels_output * topology_mask.unsqueeze(0)
-        low_sharing = self.sharing_rate_matrix < SHARING_RATE_ON
-        self.hidden_channels[:, low_sharing] = 0
-        
-        # Compute contributions
-        contributions = self._compute_energy_contributions(shareable_energy, proportions)
+        has_shareable = (shareable_energy > 0).any()
+        if has_shareable:
+            proportions, hidden_channels_output = self.energy_distribution_cnn(
+                shareable_energy, terrain, self.sharing_rate_matrix, self.hidden_channels, self.rotation_matrix
+            )
+            topology_mask = self.topology_matrix
+            self.hidden_channels = self.hidden_channels * (1 - topology_mask.unsqueeze(0)) + hidden_channels_output * topology_mask.unsqueeze(0)
+            updated_sharing = _sharing_rate_from_hidden(self.hidden_channels[0])
+            self.sharing_rate_matrix = self.sharing_rate_matrix * (1 - topology_mask) + updated_sharing * topology_mask
+            contributions = self._compute_energy_contributions(shareable_energy, proportions)
+        else:
+            contributions = torch.zeros(3, 3, self.world_size, self.world_size, device=device, dtype=torch.float32)
+            self.new_cell_candidates = torch.zeros_like(self.new_cell_candidates)
+            self._has_new_cell_candidates = False
+            self.new_cell_contributions = contributions
+            self.energy_matrix = torch.nan_to_num(self.energy_matrix, nan=0.0, posinf=1.0, neginf=0.0)
+            self.energy_matrix = torch.clamp(self.energy_matrix, 0, 1) * self.topology_matrix
+            return harvested_energy
         
         full_distributed = self._shift_sum_contributions(contributions)
         parent_incoming = self._compute_parent_incoming(contributions)
@@ -1291,9 +1381,8 @@ class OrganismManager:
         distributed_total = full_distributed
         distributed_total = torch.where(living, shareable_energy + parent_incoming, distributed_total)
         
-        # Calculate new cell candidates
         self.new_cell_candidates = (distributed_total > self.reproduction_threshold) & (self.topology_matrix == 0)
-        self._has_new_cell_candidates = self.new_cell_candidates.any().item()
+        self._has_new_cell_candidates = bool(self.new_cell_candidates.any())
         self.new_cell_contributions = contributions
         
         energy_incoming = distributed_total - shareable_energy
@@ -1350,7 +1439,7 @@ class OrganismManager:
         
         self.energy_matrix = torch.nan_to_num(self.energy_matrix, nan=0.0, posinf=1.0, neginf=0.0)
         self.energy_matrix = torch.clamp(self.energy_matrix, 0, 1) * self.topology_matrix
-        self._flush_tick_destroyed()
+        self._remove_dead_cells()
         return harvested_energy
 class Renderer:
     def __init__(self, world_size):
@@ -1479,6 +1568,7 @@ class Renderer:
             f"Noise Frequency Multiplier: {NOISE_FREQUENCY_MULTIPLIER}",
             f"Noise Octaves: {NOISE_OCTAVES}",
             f"Noise Power: {NOISE_POWER}",
+            f"Harvest Depletion Scale: {HARVEST_DEPLETION_SCALE}",
             f"",
             f"=== ORGANISM CONFIG ===",
             f"Seed Count: {ORGANISM_COUNT}",
@@ -1505,6 +1595,7 @@ class Renderer:
             new_cells = torch.sum(simulation_data['new_cell_candidates']).item()
             
             lines.extend([
+                f"Harvest Depletion Scale: {simulation_data['harvest_depletion_scale']:.4f}",
                 f"System Energy: {system_energy:.2f}",
                 f"Terrain Energy: {terrain_energy:.2f}",
                 f"Organism Energy: {organism_energy:.2f}",
@@ -1673,10 +1764,11 @@ class Renderer:
     
 
 class Simulation:
-    def __init__(self, enable_debug: bool = True, enable_log: bool = False):
+    def __init__(self, enable_debug: bool = True, enable_log: bool = False, harvest_depletion_scale=None):
         self.world_size = WORLD_SIZE
-        self.environment = Environment(self.world_size, NOISE_SCALE, QUANTIZATION_STEP)
+        self.environment = Environment(self.world_size, NOISE_SCALE, QUANTIZATION_STEP, harvest_depletion_scale=harvest_depletion_scale)
         self.organism_manager = OrganismManager(self.world_size, ORGANISM_COUNT, self.environment.terrain)
+        self.organism_manager.record_birth_events = enable_log
         self.enable_log = enable_log
         self.logger = Logger(LOG_FILE, enable_log=enable_log)
         self.tick = 0
@@ -1687,6 +1779,7 @@ class Simulation:
 
     def toggle_log_file(self):
         self.enable_log = not self.enable_log
+        self.organism_manager.record_birth_events = self.enable_log
         self.logger.set_file_logging(self.enable_log)
         print(f"Log file ({LOG_FILE}): {'ON' if self.enable_log else 'OFF'}")
     
@@ -1696,34 +1789,33 @@ class Simulation:
             harvested_energy = self.organism_manager.compute_energy(self.environment.terrain)
             self.organism_manager._birth_events = []
             self.organism_manager.compute_topology()
-            self.organism_manager._remove_dead_cells()
             self.organism_manager._flush_tick_destroyed()
             self.environment.compute_environment(self.organism_manager.topology_matrix, harvested_energy)
         
         self.logger.update_fps()
 
-        om = self.organism_manager
-        living = om.topology_matrix > 0
-        cell_count = living.sum().item()
-        if cell_count > 0:
-            living_energy = torch.nan_to_num(om.energy_matrix[living], nan=0.0)
-            min_cell_energy = living_energy.min().item()
-            max_cell_energy = living_energy.max().item()
-        else:
-            min_cell_energy = 0.0
-            max_cell_energy = 0.0
-        cy, cx = self.world_size // 2, self.world_size // 2
-        total_energy = torch.nansum(om.energy_matrix).item()
-        total_terrain = torch.nansum(self.environment.terrain).item()
-        total_pending = torch.nansum(om.pending_birth_energy).item()
-        system_energy = total_energy + total_terrain + total_pending + om.destroyed_energy
-        event = ""
-        if self._prev_cell_count > 0 and cell_count == 0:
-            event = "ALL_CELLS_DEAD"
-        elif cell_count < self._prev_cell_count:
-            event = f"CELLS_LOST {int(self._prev_cell_count - cell_count)}"
-        self._prev_cell_count = cell_count
         if self.enable_log:
+            om = self.organism_manager
+            living = om.topology_matrix > 0
+            cell_count = living.sum().item()
+            if cell_count > 0:
+                living_energy = torch.nan_to_num(om.energy_matrix[living], nan=0.0)
+                min_cell_energy = living_energy.min().item()
+                max_cell_energy = living_energy.max().item()
+            else:
+                min_cell_energy = 0.0
+                max_cell_energy = 0.0
+            cy, cx = self.world_size // 2, self.world_size // 2
+            total_energy = torch.nansum(om.energy_matrix).item()
+            total_terrain = torch.nansum(self.environment.terrain).item()
+            total_pending = torch.nansum(om.pending_birth_energy).item()
+            system_energy = total_energy + total_terrain + total_pending + om.destroyed_energy
+            event = ""
+            if self._prev_cell_count > 0 and cell_count == 0:
+                event = "ALL_CELLS_DEAD"
+            elif cell_count < self._prev_cell_count:
+                event = f"CELLS_LOST {int(self._prev_cell_count - cell_count)}"
+            self._prev_cell_count = cell_count
             self.logger.log_sim_tick(
                 self.tick,
                 cell_count,
@@ -1740,6 +1832,11 @@ class Simulation:
             self.logger.log_births(self.tick, om._birth_events)
 
         if self.enable_debug and self.tick % DEBUG_PRINT_INTERVAL == 0:
+            om = self.organism_manager
+            total_energy = torch.nansum(om.energy_matrix).item()
+            total_terrain = torch.nansum(self.environment.terrain).item()
+            total_pending = torch.nansum(om.pending_birth_energy).item()
+            system_energy = total_energy + total_terrain + total_pending + om.destroyed_energy
             debug_info = self.logger.get_debug_info()
             self.logger.log_tick(self.tick, 0, debug_info, None, None, total_energy, total_terrain, system_energy)
        
@@ -1754,11 +1851,13 @@ class Simulation:
             'hidden_channels': self.organism_manager.hidden_channels,
             'pending_birth_energy': self.organism_manager.pending_birth_energy,
             'destroyed_energy': self.organism_manager.destroyed_energy,
+            'harvest_depletion_scale': self.environment.harvest_depletion_scale,
         }
     
     def reset_for_replay(self):
         """Reset simulation for replay with new CNN"""
         self.organism_manager = OrganismManager(self.world_size, ORGANISM_COUNT, self.environment.terrain)
+        self.organism_manager.record_birth_events = self.enable_log
         self.tick = 0
         self._prev_cell_count = ORGANISM_COUNT
     
@@ -1807,6 +1906,7 @@ def load_latest_cnn():
 def start_cnn_evolution(grapher: Grapher | None = None, load_latest=False):
     """Start CNN evolution training"""
     print("Starting CNN Evolution Training...")
+    print(f"Harvest depletion scale (initial): {HARVEST_DEPLETION_SCALE}")
     # Set multiprocessing start method for PyTorch compatibility
     if multiprocessing.get_start_method(allow_none=True) is None:
         multiprocessing.set_start_method('spawn', force=True)
@@ -1898,8 +1998,7 @@ CONFIGURATION PARAMETERS (from config.py):
   
   CNN Training Configuration:
     CNN_POPULATION_SIZE     Number of CNNs in genetic algorithm population (default: 16)
-    CNN_MUTATION_RATE       Probability of mutation per parameter (default: 0.01)
-    CNN_MUTATION_MAGNITUDE  Magnitude of mutations (default: 0.01)
+    CNN mutation rate/magnitude are set each generation from cohort fitness variance
     CNN_TRAINING_EPOCHS     Number of generations to evolve (default: 100)
     CNN_TRAINING_MAX_TIME   Maximum simulation time per evaluation (default: 200)
   

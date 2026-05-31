@@ -11,18 +11,19 @@ NOISE_SCALE = 0.01
 QUANTIZATION_STEP = 0.01
 NOISE_FREQUENCY_MULTIPLIER = 8
 NOISE_OCTAVES = 6
-NOISE_POWER = 4
+NOISE_POWER = 2
 # Sine terrain: larger values make center-to-edge exponential falloff gentler
-TERRAIN_RADIAL_DECAY_SCALE = 2
+TERRAIN_RADIAL_DECAY_SCALE = 1
 PERLIN_NOISE_SCALE = 0.05  # Base scale for perlin noise
 PERLIN_TIME_SPEED = 0.005  # Speed of perlin noise animation
 PERLIN_DEAD_THRESHOLD = 0.15  # Perlin values at or below this become zero terrain (dead zones)
 PERLIN_FREQUENCY_VARIATION = 0  # How much frequency varies over time
 PERLIN_AMPLITUDE_VARIATION = 0  # How much amplitude varies over time
+HARVEST_DEPLETION_SCALE = 0.353267  # Terrain depletion per harvest (Perlin default; training starts here)
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.05
-ENERGY_DECAY = 0.02
+ENERGY_DECAY = 0.05
 
 # Spawn organism at sine terrain peak by default
 # For default NOISE_SCALE = 0.01, NOISE_FREQUENCY_MULTIPLIER = 3, peaks are at multiples of about 8
@@ -66,10 +67,10 @@ LOG_FILE = "simulation.log"
 
 # CNN Training Configuration
 CNN_POPULATION_SIZE = 16
-CNN_MUTATION_RATE = 0.05
-CNN_MUTATION_MAGNITUDE = 0.1
+CNN_MUTATION_RATE = 0.5
+CNN_MUTATION_MAGNITUDE = 0.5
 CNN_TRAINING_EPOCHS = 100
-CNN_TRAINING_MAX_TIME = 400
+CNN_TRAINING_MAX_TIME = 500
 CNN_FITNESS_EARLY_TERMINATION_THRESHOLD = 0.1
 TRAIN_HEADLESS = True
 TRAIN_WORKER_COUNT = None
