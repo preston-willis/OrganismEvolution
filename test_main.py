@@ -26,7 +26,7 @@ from main import (
     load_latest_cnn,
 )
 import oriented_conv
-from config import DEATH_THRESHOLD, ENERGY_DECAY, ENERGY_HARVEST_RATE, MAX_CHILDREN_PER_PARENT, REPRODUCTION_THRESHOLD, SHARING_RATE_ON, SHARING_RATE_OFF
+from config import DEATH_THRESHOLD, ENERGY_DECAY, ENERGY_HARVEST_RATE, MAX_CHILDREN_PER_PARENT, PERLIN_DEAD_THRESHOLD, PERLIN_TIME_SPEED, REPRODUCTION_THRESHOLD, SHARING_RATE_ON, SHARING_RATE_OFF
 
 device = main_module.device
 SMALL = 12
@@ -271,14 +271,15 @@ class TestEnergyDistributionCNN(unittest.TestCase):
         sums = proportions.sum(dim=(0, 1))
         self.assertTrue(torch.allclose(sums, torch.ones(self.H, self.H, device=device), rtol=1e-4))
 
-    def test_binary_hidden_output(self):
+    def test_sigmoid_hidden_output(self):
         shareable = torch.rand(self.H, self.H, device=device)
         terrain = torch.rand(self.H, self.H, device=device)
         sharing = torch.rand(self.H, self.H, device=device)
         hidden = torch.rand(1, self.H, self.H, device=device)
         rotation = torch.zeros(self.H, self.H, device=device)
         _, hidden_out = self.cnn(shareable, terrain, sharing, hidden, rotation)
-        self.assertTrue(torch.all((hidden_out == 0) | (hidden_out == 1)))
+        self.assertTrue(torch.all(hidden_out >= 0))
+        self.assertTrue(torch.all(hidden_out <= 1))
 
     def test_rotate_proportions_moves_local_north(self):
         H = 8
@@ -585,7 +586,7 @@ class TestOrganismManagerEnergy(unittest.TestCase):
         self.assertAlmostEqual(self.om.sharing_rate_matrix[y, x].item(), SHARING_RATE_ON, places=5)
         self.assertEqual(self.om.hidden_channels[0, y, x].item(), 1.0)
 
-    def test_low_sharing_cells_keep_hidden_off(self):
+    def test_sharing_rate_tracks_sigmoid_hidden(self):
         y, x = 6, 6
         self.om.topology_matrix.zero_()
         self.om.energy_matrix.zero_()
@@ -594,18 +595,20 @@ class TestOrganismManagerEnergy(unittest.TestCase):
         self.om.topology_matrix[y, x] = 1
         self.om.energy_matrix[y, x] = 0.8
         self.om.sharing_rate_matrix[y, x] = SHARING_RATE_OFF
-        self.om.hidden_channels[0, y, x] = 1.0
+        self.om.hidden_channels[0, y, x] = 0.0
         props = uniform_proportions(SMALL, 1, 1)
-        cnn_hidden = torch.ones(1, SMALL, SMALL, device=device)
+        cnn_hidden = torch.full((1, SMALL, SMALL), 0.75, device=device)
 
-        def sets_hidden_on(shareable, terrain, sharing, hidden, rotation):
+        def sets_hidden(shareable, terrain, sharing, hidden, rotation):
             return props, cnn_hidden
 
         terrain = torch.ones(SMALL, SMALL, device=device)
         with patch("main.ENERGY_DECAY", 0.0):
-            with patch.object(self.om.energy_distribution_cnn, "forward", side_effect=sets_hidden_on):
+            with patch.object(self.om.energy_distribution_cnn, "forward", side_effect=sets_hidden):
                 self.om.compute_energy(terrain)
-        self.assertEqual(self.om.hidden_channels[0, y, x].item(), 0.0)
+        self.assertAlmostEqual(self.om.hidden_channels[0, y, x].item(), 0.75, places=5)
+        expected_sharing = SHARING_RATE_OFF + 0.75 * (SHARING_RATE_ON - SHARING_RATE_OFF)
+        self.assertAlmostEqual(self.om.sharing_rate_matrix[y, x].item(), expected_sharing, places=5)
 
     def test_grandchild_links_to_intermediate_parent(self):
         py, px = 6, 6
@@ -663,20 +666,23 @@ class TestOrganismManagerEnergy(unittest.TestCase):
         if om.new_cell_candidates.any():
             self.assertTrue(torch.all(om.energy_matrix[empty & om.new_cell_candidates] == 0))
 
-    def test_sharing_rate_immutable_during_life(self):
+    def test_sharing_rate_updates_from_sigmoid_hidden(self):
         sim = Simulation(enable_debug=False)
         om = sim.organism_manager
         cy, cx = sim.world_size // 2, sim.world_size // 2
         om.sharing_rate_matrix[cy, cx] = SHARING_RATE_OFF
+        om.hidden_channels[0, cy, cx] = 0.0
         props = uniform_proportions(sim.world_size, 1, 1)
+        cnn_hidden = torch.full((1, sim.world_size, sim.world_size), 0.25, device=device)
 
-        def unchanged_sharing(shareable, terr, sharing, hidden, rotation):
-            return props, hidden
+        def update_hidden(shareable, terr, sharing, hidden, rotation):
+            return props, cnn_hidden
 
-        with patch.object(om.energy_distribution_cnn, "forward", side_effect=unchanged_sharing):
+        with patch.object(om.energy_distribution_cnn, "forward", side_effect=update_hidden):
             for _ in range(20):
                 sim.update_simulation()
-        self.assertAlmostEqual(om.sharing_rate_matrix[cy, cx].item(), SHARING_RATE_OFF, places=5)
+        expected_sharing = SHARING_RATE_OFF + 0.25 * (SHARING_RATE_ON - SHARING_RATE_OFF)
+        self.assertAlmostEqual(om.sharing_rate_matrix[cy, cx].item(), expected_sharing, places=5)
 
     def test_parent_incoming_reads_from_parent_not_candidate(self):
         ring = EnergyDistributionCNN._RING_CIJ
@@ -866,8 +872,11 @@ class TestEnvironment(unittest.TestCase):
         harvested = torch.zeros(SMALL, SMALL, device=device)
         harvested[6, 6] = 0.2
         env.compute_environment(topology, harvested)
+        env.time -= PERLIN_TIME_SPEED
         fresh = env._generate_perlin_terrain()
-        expected = torch.clamp(fresh - harvested * topology, 0, 1)
+        expected = torch.clamp(fresh - harvested * 100 * topology, 0, 1)
+        if PERLIN_DEAD_THRESHOLD > 0:
+            expected = expected * (expected > PERLIN_DEAD_THRESHOLD)
         self.assertAlmostEqual(env.terrain[6, 6].item(), expected[6, 6].item(), places=4)
 
     def test_sub_threshold_cells_skip_sharing(self):

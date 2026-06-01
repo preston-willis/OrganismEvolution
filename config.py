@@ -11,7 +11,7 @@ NOISE_SCALE = 0.01
 QUANTIZATION_STEP = 0.01
 NOISE_FREQUENCY_MULTIPLIER = 8
 NOISE_OCTAVES = 6
-NOISE_POWER = 4
+NOISE_POWER = 2
 # Sine terrain: larger values make center-to-edge exponential falloff gentler
 TERRAIN_RADIAL_DECAY_SCALE = 2
 PERLIN_NOISE_SCALE = 0.05  # Base scale for perlin noise
@@ -22,7 +22,7 @@ PERLIN_AMPLITUDE_VARIATION = 0  # How much amplitude varies over time
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.05
-ENERGY_DECAY = 0.02
+ENERGY_DECAY = 0.05
 
 # Spawn organism at sine terrain peak by default
 # For default NOISE_SCALE = 0.01, NOISE_FREQUENCY_MULTIPLIER = 3, peaks are at multiples of about 8

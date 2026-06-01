@@ -198,7 +198,7 @@ class EnergyDistributionCNN(torch.nn.Module):
         proportions = proportions_flat.view(3, 3, world_size, world_size)
         proportions = self._rotate_proportions_8way(proportions, rotation_matrix)
         
-        hidden_channels_output = (torch.sigmoid(hidden_channels_output) > 0.5).float()  # (1, H, W)
+        hidden_channels_output = torch.sigmoid(hidden_channels_output)  # (1, H, W)
         
         return proportions, hidden_channels_output
 
@@ -345,6 +345,9 @@ def _release_device_memory(torch_device):
         torch.mps.empty_cache()
     elif torch_device.type == 'cuda':
         torch.cuda.empty_cache()
+
+def _sharing_rate_from_hidden(hidden):
+    return SHARING_RATE_OFF + hidden * (SHARING_RATE_ON - SHARING_RATE_OFF)
 
 def _evaluate_cnn_worker(args):
     """Worker function for multiprocessing CNN evaluation"""
@@ -779,7 +782,7 @@ class Environment:
             # Perlin terrain regenerates each tick; deplete by harvest for energy conservation
             self.time += PERLIN_TIME_SPEED
             self.terrain.copy_(self._generate_perlin_terrain())
-            self.terrain.copy_(torch.clamp(self.terrain - (harvested_energy * topology_matrix), 0, 1))
+            self.terrain.copy_(torch.clamp(self.terrain - (harvested_energy*100 * topology_matrix), 0, 1))
             return
 
         # Deplete terrain by the amount organisms harvested
@@ -1100,9 +1103,9 @@ class OrganismManager:
             y_coords, x_coords = self.positions[:, 1], self.positions[:, 0]
             self.topology_matrix[y_coords, x_coords] = 1
             self.energy_matrix[y_coords, x_coords] = 1
-            seed_sharing_rate = SHARING_RATE_ON if ENERGY_SHARING_RATE > 0 else SHARING_RATE_OFF
-            self.sharing_rate_matrix[y_coords, x_coords] = seed_sharing_rate
-            self.hidden_channels[:, y_coords, x_coords] = 0
+            seed_hidden = 1.0 if ENERGY_SHARING_RATE > 0 else 0.0
+            self.hidden_channels[:, y_coords, x_coords] = seed_hidden
+            self.sharing_rate_matrix[y_coords, x_coords] = _sharing_rate_from_hidden(seed_hidden)
             self.rotation_matrix[y_coords, x_coords] = 0
             self.parent_giver_dir[y_coords, x_coords] = 0
     
@@ -1114,9 +1117,8 @@ class OrganismManager:
         snapped_angles = rotation_bucket.float() * (torch.pi / 4)
         self.rotation_matrix[birth_mask] = snapped_angles[birth_mask]
         giver_hidden = self.hidden_channels[0, parent_y, parent_x]
-        child_rate = SHARING_RATE_OFF + giver_hidden * (SHARING_RATE_ON - SHARING_RATE_OFF)
-        self.sharing_rate_matrix[birth_mask] = child_rate[birth_mask]
         self.hidden_channels[0, birth_mask] = giver_hidden[birth_mask]
+        self.sharing_rate_matrix[birth_mask] = _sharing_rate_from_hidden(giver_hidden)[birth_mask]
 
     def _record_birth_events(self, birth_mask, contrib_by_giver_dir=None):
         if not birth_mask.any():
@@ -1208,18 +1210,18 @@ class OrganismManager:
         
         harvested_energy = torch.minimum(local_terrain, self.sharing_rate_matrix * ENERGY_HARVEST_RATE)
         
-        energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0) + local_terrain.unsqueeze(0).unsqueeze(0)
+        energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0)
         average_energy = torch.nn.functional.conv2d(
             energy_unsqueezed,
             torch.ones((1, 1, 3, 3), device=device, dtype=torch.float32),
             padding=1,
         ).squeeze(0).squeeze(0) / 9.0
-        decay_amount = self.sharing_rate_matrix**2 * (1.0 - average_energy)
+        decay_amount = (1.0 - average_energy)
         
         energy_after_harvest = self.energy_matrix + harvested_energy
         energy_before_decay = energy_after_harvest * self.topology_matrix
         self.energy_matrix = torch.clamp(
-            (energy_after_harvest - decay_amount * ENERGY_DECAY-0.01) * self.topology_matrix,
+            (energy_after_harvest - decay_amount * ENERGY_DECAY-0.001) * self.topology_matrix,
             0,
             1,
         )
@@ -1272,15 +1274,15 @@ class OrganismManager:
         # Shareable outbound energy (new tensor; energy_matrix is updated later in sharing)
         shareable_energy = self.energy_matrix * self.topology_matrix * self.sharing_rate_matrix
         
-        # Get 3x3 proportions and hidden_channels output from CNN; sharing_rate is fixed at birth
+        # Get 3x3 proportions and hidden_channels output from CNN
         proportions, hidden_channels_output = self.energy_distribution_cnn(
             shareable_energy, terrain, self.sharing_rate_matrix, self.hidden_channels, self.rotation_matrix
         )
         
         topology_mask = self.topology_matrix
         self.hidden_channels = self.hidden_channels * (1 - topology_mask.unsqueeze(0)) + hidden_channels_output * topology_mask.unsqueeze(0)
-        low_sharing = self.sharing_rate_matrix < SHARING_RATE_ON
-        self.hidden_channels[:, low_sharing] = 0
+        updated_sharing = _sharing_rate_from_hidden(self.hidden_channels[0])
+        self.sharing_rate_matrix = self.sharing_rate_matrix * (1 - topology_mask) + updated_sharing * topology_mask
         
         # Compute contributions
         contributions = self._compute_energy_contributions(shareable_energy, proportions)
