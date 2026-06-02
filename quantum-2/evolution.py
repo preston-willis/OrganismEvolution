@@ -2,14 +2,21 @@ import random
 
 import numpy as np
 
+from checkpoint import clone_genome, save_genome_checkpoint
 from config import (
+    DRIVE_AMP,
+    DRIVE_OMEGA,
     MUTATION_RATE,
     N_GENERATIONS,
     N_QUBITS,
     N_TERMS,
+    OUTPUT_DIR,
     POPULATION_SIZE,
+    SAVE_EVERY_GENERATION,
+    TASK,
+    TRAIN_DRIVE,
 )
-from fitness import fitness, level_spacing_ratio
+from fitness import evaluate_genome, level_spacing_ratio
 from hamiltonian import build_hamiltonian
 
 
@@ -47,9 +54,29 @@ def mutate(genome, n_qubits, rate=MUTATION_RATE):
 def crossover(g1, g2):
     n = min(len(g1), len(g2))
     if n <= 1:
-        return g1 if random.random() < 0.5 else g2
+        return clone_genome(g1 if random.random() < 0.5 else g2)
     cut = random.randint(1, n - 1)
     return g1[:cut] + g2[cut:]
+
+
+def _format_gen_line(gen, task, gen_score, metrics):
+    if task == "transfer":
+        return (
+            f"Gen {gen}: fitness={gen_score:.4f}, "
+            f"transfer={metrics['transfer']:.4f}, "
+            f"p_B={metrics['p_b_exc']:.4f}, p_A={metrics['p_a_exc']:.4f}"
+        )
+    if task == "spacing":
+        r = metrics.get("r")
+        if r is None:
+            return f"Gen {gen}: fitness={gen_score:.2f}, r=invalid"
+        return f"Gen {gen}: fitness={gen_score:.2f}, r={r:.4f}"
+    r = metrics.get("r")
+    r_str = f"{r:.4f}" if r is not None else "invalid"
+    return (
+        f"Gen {gen}: fitness={gen_score:.4f}, "
+        f"transfer={metrics.get('transfer', 0):.4f}, r={r_str}"
+    )
 
 
 def evolve(
@@ -57,41 +84,55 @@ def evolve(
     pop_size=POPULATION_SIZE,
     generations=N_GENERATIONS,
     n_terms=N_TERMS,
+    task=TASK,
+    train_drive=TRAIN_DRIVE,
+    out_dir=OUTPUT_DIR,
+    save_every_gen=SAVE_EVERY_GENERATION,
 ):
     population = [random_genome(n_qubits, n_terms) for _ in range(pop_size)]
     best_score = 0.0
-    best_genome = population[0]
-    best_r = 0.0
+    best_genome = clone_genome(population[0])
+    best_metrics = {}
+
+    drive_amp = DRIVE_AMP if train_drive and task in ("transfer", "combined") else 0.0
 
     for gen in range(generations):
-        scores = [fitness(g, n_qubits) for g in population]
-        ranked = sorted(
-            zip(scores, population),
-            reverse=True,
-            key=lambda x: x[0][0],
-        )
+        scored = []
+        for g in population:
+            score, metrics = evaluate_genome(
+                g, n_qubits, task, drive_amp=drive_amp, drive_omega=DRIVE_OMEGA
+            )
+            scored.append((score, metrics, g))
 
-        gen_score, gen_r = ranked[0][0]
-        gen_genome = ranked[0][1]
+        ranked = sorted(scored, reverse=True, key=lambda x: x[0])
+        gen_score, gen_metrics, gen_genome = ranked[0]
+
         if gen_score > best_score:
             best_score = gen_score
-            best_r = gen_r
-            best_genome = gen_genome
+            best_metrics = dict(gen_metrics)
+            best_genome = clone_genome(gen_genome)
 
-        if gen_r is None:
-            print(f"Gen {gen}: fitness={gen_score:.2f}, r=invalid")
-        else:
-            print(f"Gen {gen}: fitness={gen_score:.2f}, r={gen_r:.4f}")
+        print(_format_gen_line(gen, task, gen_score, gen_metrics))
+
+        if save_every_gen and out_dir:
+            save_genome_checkpoint(
+                best_genome,
+                n_qubits,
+                out_dir,
+                task,
+                best_score,
+                best_metrics,
+                gen,
+            )
+            print(f"  → saved checkpoint (best so far) gen {gen}")
 
         survivors = [
-            g
-            for (s, _), g in ranked
-            if s > 0 and np.isfinite(s)
+            g for score, _, g in ranked if score > 0 and np.isfinite(score)
         ][: pop_size // 5]
         if not survivors:
             survivors = [random_genome(n_qubits, n_terms) for _ in range(pop_size // 5)]
 
-        new_pop = [best_genome]
+        new_pop = [clone_genome(best_genome)]
         new_pop.extend(survivors[: pop_size // 5])
         while len(new_pop) < pop_size:
             p1, p2 = random.sample(survivors, 2)
@@ -100,4 +141,9 @@ def evolve(
 
         population = new_pop[:pop_size]
 
-    return best_score, best_r, best_genome
+    if task == "spacing" and best_metrics.get("r") is None:
+        best_metrics["r"] = level_spacing_ratio(
+            build_hamiltonian(best_genome, n_qubits)
+        )
+
+    return best_score, best_metrics, best_genome

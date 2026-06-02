@@ -1,84 +1,38 @@
 {
-  "critical": true,
-  "primary_critical": true,
-  "scaling_critical": true,
-  "verdict": "Mean r=0.4580 is within 0.015 of critical target 0.458. Finite-size padding preserves critical mean r at all checked sizes. Dominant terms do not match built-in Ising/XXZ references.",
-  "hamiltonian": "H = +0.8945\u00b7YXYIXYYX +0.7039\u00b7ZZZXYYZX -0.6254\u00b7ZXZXZXXZ +0.3992\u00b7IIZZXYYX -0.3307\u00b7ZXYIZZYI +0.0325\u00b7IZYIZXXY",
-  "n_qubits": 8,
+  "generation": 49,
+  "n_qubits": 4,
+  "task": "transfer",
+  "fitness": 0.8969565803489624,
   "genome": [
     [
-      0.8944653448906079,
-      "YXYIXYYX"
+      -0.058271006691766866,
+      "YIXY"
     ],
     [
-      0.7039198992791582,
-      "ZZZXYYZX"
+      0.07553004218684334,
+      "XZII"
     ],
     [
-      -0.3307424288862374,
-      "ZXYIZZYI"
+      -0.006047907327184524,
+      "ZZII"
     ],
     [
-      0.3992464409318446,
-      "IIZZXYYX"
+      0.3892849881231832,
+      "IIXX"
     ],
     [
-      -0.6254102745538188,
-      "ZXZXZXXZ"
+      -0.03335405381028192,
+      "YYIX"
     ],
     [
-      0.03246797543031173,
-      "IZYIZXXY"
+      0.052925976514547696,
+      "IIZI"
     ]
   ],
-  "r_target": 0.458,
-  "r_poisson": 0.386,
-  "r_wigner": 0.53,
-  "spacing": {
-    "n_qubits": 8,
-    "r_mean": 0.45799855115083943,
-    "r_std": 1.0828232312538133e-15,
-    "n_levels": 256,
-    "n_ratios": 2,
-    "frac_ratios_in_poisson_goe_band": 1.0,
-    "distance_to_target": 1.448849160590182e-06
-  },
-  "finite_size_scaling": [
-    {
-      "n_qubits": 8,
-      "r_mean": 0.45799855115083943,
-      "r_std": 1.0828232312538133e-15,
-      "n_levels": 256,
-      "n_ratios": 2,
-      "frac_ratios_in_poisson_goe_band": 1.0,
-      "distance_to_target": 1.448849160590182e-06
-    }
-  ],
-  "reference_models": [
-    {
-      "name": "Transverse Ising (chain)",
-      "n_qubits": 8,
-      "r_mean": 0.5606601717798212,
-      "r_std": 0.14644660940672613,
-      "n_levels": 256,
-      "n_ratios": 4,
-      "frac_ratios_in_poisson_goe_band": 0.5,
-      "distance_to_target": 0.10266017177982117
-    },
-    {
-      "name": "XXZ (nearest-neighbor)",
-      "n_qubits": 8,
-      "r_mean": 0.7817337078570782,
-      "r_std": 0.18902415378560097,
-      "n_levels": 256,
-      "n_ratios": 7,
-      "frac_ratios_in_poisson_goe_band": 0.0,
-      "distance_to_target": 0.32373370785707817
-    }
-  ],
-  "known_overlap": [],
-  "artifacts": {
-    "spectrum_plot": "/Users/preston/Desktop/OrganismEvolution/quantum-2/output/spectrum_analysis.png",
-    "scaling_plot": null
+  "training": {
+    "transfer": 0.8969565803489624,
+    "p_b_exc": 0.9921022533679033,
+    "p_a_exc": 0.19029134603788173,
+    "transfer_fitness": 0.8969565803489624
   }
 }

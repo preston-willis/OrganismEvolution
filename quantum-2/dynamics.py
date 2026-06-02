@@ -63,6 +63,18 @@ def probability_grid(psi, n_a):
     return np.abs(amp) ** 2
 
 
+def transfer_metrics(psi, n_a, lambda_a):
+    grid = probability_grid(psi, n_a)
+    p_b_exc = float(1.0 - grid[:, 0].sum())
+    p_a_exc = float(grid[1:, :].sum())
+    transfer = p_b_exc - lambda_a * p_a_exc
+    return {
+        "transfer": transfer,
+        "p_b_exc": p_b_exc,
+        "p_a_exc": p_a_exc,
+    }
+
+
 def bipartition_entropy(psi, n_a):
     n_qubits = _n_qubits_from_psi(psi)
     n_b = n_qubits - n_a

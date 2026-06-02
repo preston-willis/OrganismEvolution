@@ -104,7 +104,7 @@ def plot_scaling(scaling_rows, save_path):
     plt.close(fig)
 
 
-def build_report(genome, n_qubits, scale_sizes, out_dir, show_plots):
+def build_report(genome, n_qubits, scale_sizes, out_dir, show_plots, train_metrics=None):
     os.makedirs(out_dir, exist_ok=True)
 
     sizes = sorted({n_qubits} | {n for n in scale_sizes if n >= n_qubits})
@@ -148,6 +148,18 @@ def build_report(genome, n_qubits, scale_sizes, out_dir, show_plots):
     else:
         verdict_parts.append("Dominant terms do not match built-in Ising/XXZ references.")
 
+    from config import DRIVE_AMP, DRIVE_OMEGA, ROLLOUT_STEPS
+    from fitness import spacing_fitness, transfer_fitness
+
+    _, transfer_eval = transfer_fitness(
+        pad_genome(genome, n_qubits),
+        n_qubits,
+        n_steps=ROLLOUT_STEPS,
+        drive_amp=DRIVE_AMP,
+        drive_omega=DRIVE_OMEGA,
+    )
+    _, r_eval = spacing_fitness(pad_genome(genome, n_qubits), n_qubits)
+
     payload = {
         "critical": primary_critical and scaling_critical,
         "primary_critical": primary_critical,
@@ -163,6 +175,9 @@ def build_report(genome, n_qubits, scale_sizes, out_dir, show_plots):
         "finite_size_scaling": scaling_rows,
         "reference_models": refs,
         "known_overlap": [{"name": name, "overlap": overlap} for name, overlap in known_hits],
+        "transfer_eval": transfer_eval,
+        "r_eval": r_eval,
+        "training": train_metrics,
         "artifacts": {
             "spectrum_plot": analyze_path,
             "scaling_plot": scaling_path if len(scaling_rows) > 1 else None,
@@ -180,6 +195,12 @@ def build_report(genome, n_qubits, scale_sizes, out_dir, show_plots):
     print(f"  mean r       = {stats['r_mean']:.4f}  (target {R_TARGET:.3f})")
     print(f"  r std        = {stats['r_std']:.4f}")
     print(f"  in-band frac = {stats['frac_ratios_in_poisson_goe_band']:.0%} of ratios between Poisson and GOE")
+    print(
+        f"  A→B transfer (eval) = {transfer_eval['transfer']:.4f}  "
+        f"(p_B={transfer_eval['p_b_exc']:.4f}, p_A={transfer_eval['p_a_exc']:.4f})"
+    )
+    if r_eval is not None:
+        print(f"  spacing r (eval)  = {r_eval:.4f}")
     print()
     print("Finite-size scaling (extra qubits padded with I):")
     for row in scaling_rows:

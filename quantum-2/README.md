@@ -14,7 +14,7 @@ Evolutionary search over **Pauli-string Hamiltonians**, then an automatic **crit
 pip install -r quantum-2/requirements.txt
 ```
 
-## Run (default: evolve + full criticality report)
+## Run (default: A→B transfer task + report)
 
 From the **repo root**:
 
@@ -22,9 +22,11 @@ From the **repo root**:
 python3 quantum-2/__main__.py
 ```
 
+Default **`--task transfer`**: evolve Hamiltonians that move excitation from subsystem **A** to **B** (vacuum init, driven rollout during training). Spacing-only training: `--task spacing`. Both: `--task combined`.
+
 This will:
 
-1. Run the GA (4 qubits, 200 generations by default)
+1. Run the GA (8 qubits, 200 generations by default)
 2. Plot spectrum + spacing histogram + dominant terms → `quantum-2/output/spectrum_analysis.png`
 3. Check mean **r** at N=4,6,8 (embedding extra qubits as **I**) → `quantum-2/output/finite_size_scaling.png`
 4. Compare to reference Ising / XXZ models
@@ -115,8 +117,10 @@ Use `"hamiltonian"` and `"genome"` as the certified critical Hamiltonian.
 | `--steps` | 200 | Rollout steps |
 | `--dt` | 0.05 | Time step |
 | `--initial` | `vacuum` | `vacuum` or `random` |
+| `--task` | `transfer` | `spacing`, `transfer`, or `combined` |
+| `--no-train-drive` | off | Turn off drive during transfer training |
 | `--save-animation` | — | e.g. `output/field.gif` |
-| `--drive` | off | AC transverse field on all qubits |
+| `--drive` | off | AC transverse field in animation |
 | `--drive-amp` | 0.5 | Drive amplitude \(A\) |
 | `--drive-omega` | 1.0 | Drive frequency \(\omega\) |
 

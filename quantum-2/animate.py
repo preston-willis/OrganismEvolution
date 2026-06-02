@@ -47,9 +47,25 @@ def run_animation(
     n_b = n_qubits - n_a
     steps = list(range(len(entropies)))
 
-    vmax = max(np.max(g) for g in grids)
+    # Avoid frame-0 vacuum spike and rare near-product revivals pinning vmax≈1.
+    if initial == "vacuum" and len(grids) > 1:
+        pooled = np.concatenate([g.ravel() for g in grids[1:]])
+        vmax = float(np.percentile(pooled, 99.5))
+        vmax = max(vmax, float(np.max(grids[-1])), 1e-12)
+    else:
+        vmax = max(float(np.max(g)) for g in grids)
     if vmax < 1e-12:
         vmax = 1.0
+
+    from dynamics import transfer_metrics
+    from config import TRANSFER_LAMBDA
+
+    final_tm = transfer_metrics(rollout["states"][-1], n_a, TRANSFER_LAMBDA)
+    print(
+        f"Heatmap scale vmax={vmax:.4f} | "
+        f"peak|ψ|² frame0={np.max(grids[0]):.4f} final={np.max(grids[-1]):.4f} | "
+        f"p_B={final_tm['p_b_exc']:.4f} p_A={final_tm['p_a_exc']:.4f}"
+    )
 
     fig, (ax_field, ax_s) = plt.subplots(1, 2, figsize=(10, 4))
     if drive_amp != 0.0:
