@@ -21,10 +21,10 @@ PERLIN_AMPLITUDE_VARIATION = 0  # How much amplitude varies over time
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.05
-ENERGY_DECAY = 0.002
+ENERGY_DECAY = 0.005
 
 # Sharing rate values (instead of binary 0/1)
-SHARING_ON_VALUE = 0.999
+SHARING_ON_VALUE = 0.8
 SHARING_OFF_VALUE = 0.2
 
 
