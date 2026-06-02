@@ -13,7 +13,7 @@ NOISE_FREQUENCY_MULTIPLIER = 8
 NOISE_OCTAVES = 6
 NOISE_POWER = 1
 # Sine terrain: larger values make center-to-edge exponential falloff gentler
-TERRAIN_RADIAL_DECAY_SCALE = 10
+TERRAIN_RADIAL_DECAY_SCALE = 2
 PERLIN_NOISE_SCALE = 0.05  # Base scale for perlin noise
 PERLIN_TIME_SPEED = 0.005  # Speed of perlin noise animation
 PERLIN_FREQUENCY_VARIATION = 0  # How much frequency varies over time
