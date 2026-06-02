@@ -13,7 +13,7 @@ NOISE_FREQUENCY_MULTIPLIER = 8
 NOISE_OCTAVES = 6
 NOISE_POWER = 1
 # Sine terrain: larger values make center-to-edge exponential falloff gentler
-TERRAIN_RADIAL_DECAY_SCALE = 2
+TERRAIN_RADIAL_DECAY_SCALE = 1
 PERLIN_NOISE_SCALE = 0.05  # Base scale for perlin noise
 PERLIN_TIME_SPEED = 0.005  # Speed of perlin noise animation
 PERLIN_FREQUENCY_VARIATION = 0  # How much frequency varies over time
@@ -21,7 +21,7 @@ PERLIN_AMPLITUDE_VARIATION = 0  # How much amplitude varies over time
 
 # Organism Configuration
 ENERGY_HARVEST_RATE = 0.05
-ENERGY_DECAY = 0.001
+ENERGY_DECAY = 0.002
 
 # Sharing rate values (instead of binary 0/1)
 SHARING_ON_VALUE = 0.999
