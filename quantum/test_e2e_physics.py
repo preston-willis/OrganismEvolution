@@ -8,13 +8,12 @@ import torch
 from quantum.device import get_device, get_dtype
 from quantum.evolution import evaluate_organism, init_population, run_generation, train
 from quantum.physics import (
+    critical_edge_initial_state,
     evolution_step,
     matrix_exp_unitary,
     partial_trace,
-    random_product_state,
     total_hamiltonian,
-    track_complexity,
-    vacuum_product_state,
+    track_criticality,
     von_neumann_entropy,
 )
 
@@ -41,17 +40,17 @@ def assert_unitary(test_case, U, atol=1e-3):
 
 class TestE2EPhysics(unittest.TestCase):
     def test_hamiltonian_and_unitary(self):
-        M_A, M_B = init_population(1, N_E2E, dtype, device)[0]
-        H_total, H_A = total_hamiltonian(M_A, M_B, N_E2E, G, dtype, device)
-        assert_hermitian(self, H_A)
+        M = init_population(1, N_E2E, dtype, device)[0]
+        H_total, H = total_hamiltonian(M, N_E2E, G, dtype, device)
+        assert_hermitian(self, H)
         assert_hermitian(self, H_total)
         assert_unitary(self, matrix_exp_unitary(H_total, DT))
 
     def test_evolution_preserves_norm_e2e(self):
-        M_A, M_B = init_population(1, N_E2E, dtype, device)[0]
-        psi = random_product_state(N_E2E, dtype, device)
+        M = init_population(1, N_E2E, dtype, device)[0]
+        psi = critical_edge_initial_state(N_E2E, dtype, device, 99)
         for _ in range(10):
-            _, psi = evolution_step(M_A, M_B, psi, N_E2E, G, DT, device)
+            _, psi = evolution_step(M, psi, N_E2E, G, DT, device)
             self.assertAlmostEqual(state_norm(psi), 1.0, places=4)
 
     def test_train_full_simulation_physics(self):
@@ -71,30 +70,30 @@ class TestE2EPhysics(unittest.TestCase):
 
         for entry in history:
             self.assertIn("best_fitness", entry)
-            self.assertIn("entanglement", entry)
-            self.assertGreaterEqual(entry["entanglement"], -1e-6)
+            self.assertIn("f_static", entry)
+            self.assertIn("f_dynamic", entry)
 
-        M_A, M_B = population[0]
-        psi = vacuum_product_state(N_E2E, dtype, device)
-        _, evolved = evaluate_organism(M_A, M_B, psi, N_E2E, 5, G, DT, device)
-        metrics = track_complexity(evolved, M_A, N_E2E)
-        self.assertIn("participation_ratio", metrics)
+        M = population[0]
+        psi = critical_edge_initial_state(N_E2E, dtype, device, 1)
+        _, evolved = evaluate_organism(M, psi, N_E2E, 5, G, DT, device)
+        metrics = track_criticality(evolved, M, N_E2E, dtype, device)
+        self.assertIn("r_mean", metrics)
 
     def test_run_generation_best_uses_evolved_state(self):
         pop = init_population(4, N_E2E, dtype, device)
-        _, _, complexity, _, _, _, psi_final = run_generation(
+        _, _, metrics, _, _, psi_final = run_generation(
             pop, N_E2E, 5, G, DT, device, dtype
         )
-        M_A, _ = pop[0]
-        direct = track_complexity(psi_final, M_A, N_E2E)
+        M = pop[0]
+        direct = track_criticality(psi_final, M, N_E2E, dtype, device)
         self.assertAlmostEqual(
-            complexity["entanglement"], direct["entanglement"], places=4
+            metrics["entanglement"], direct["entanglement"], places=4
         )
 
-    def test_vacuum_partial_trace_zero_entropy(self):
-        psi = vacuum_product_state(N_E2E, dtype, device)
-        rho_A = partial_trace(torch.outer(psi, psi.conj()), N_E2E)
-        self.assertAlmostEqual(von_neumann_entropy(rho_A).item(), 0.0, places=4)
+    def test_critical_edge_initial_zero_entanglement(self):
+        psi = critical_edge_initial_state(N_E2E, dtype, device, 42)
+        rho_B = partial_trace(torch.outer(psi, psi.conj()), N_E2E)
+        self.assertAlmostEqual(von_neumann_entropy(rho_B).item(), 0.0, places=4)
 
 
 if __name__ == "__main__":

@@ -1,42 +1,33 @@
 import argparse
 
-from quantum.basin import basin_size_experiment
-from quantum.config import BASIN_N_VALUES, N, N_GENERATIONS, TRAIN_HEADLESS
+from quantum.config import N, N_GENERATIONS, TRAIN_HEADLESS
 from quantum.evolution import train
 from quantum.grapher import QuantumGrapher
-from quantum.sim import run_loaded_simulation
+from quantum.sim import run_loaded_simulation, run_physics_demo
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Quantum coevolution simulation",
+        description="Evolve Hamiltonians at the quantum critical edge (vacuum ⊗ disorder)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-  --train              Run neuroevolution training
-  --graph              Show matplotlib graphs during --train
-  --load               With --train: resume training. Alone: animate loaded best organism
-  --basin              Basin-of-attraction scaling experiment
+  --train              Evolve H to sustain entanglement between area and volume law
+  --graph              Live matplotlib during --train
+  --load               Resume training, or animate best checkpoint
+  --demo               Rabi oscillation sanity check (fixed physics)
         """,
     )
-    parser.add_argument(
-        "--train",
-        action="store_true",
-        help="Run neuroevolution training",
-    )
-    parser.add_argument(
-        "--graph",
-        action="store_true",
-        help="Show matplotlib graphs during --train",
-    )
+    parser.add_argument("--train", action="store_true", help="Run training")
+    parser.add_argument("--graph", action="store_true", help="Show graphs during --train")
     parser.add_argument(
         "--load",
         action="store_true",
-        help="Load latest checkpoint; with --train resume, without --train run rollout viewer",
+        help="Load latest checkpoint; with --train resume, else rollout viewer",
     )
     parser.add_argument(
-        "--basin",
+        "--demo",
         action="store_true",
-        help="Run basin-size experiment",
+        help="Animate Rabi demo (fixed physics, not the training objective)",
     )
     parser.add_argument(
         "--generations",
@@ -46,8 +37,8 @@ def main():
     )
     args = parser.parse_args()
 
-    if args.basin:
-        basin_size_experiment(n_values=BASIN_N_VALUES)
+    if args.demo:
+        run_physics_demo()
         return
 
     if args.load and not args.train:
@@ -57,9 +48,9 @@ def main():
     if args.train:
         use_graph = (not TRAIN_HEADLESS) or args.graph
         if TRAIN_HEADLESS and not args.graph:
-            print("Headless training mode (no matplotlib graphs)")
+            print("Headless training (quantum critical edge)")
         elif args.graph:
-            print("Training with matplotlib graphs")
+            print("Training with graphs")
         grapher = QuantumGrapher(N) if use_graph else None
         train(n_generations=args.generations, grapher=grapher, load=args.load)
         return

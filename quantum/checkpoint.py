@@ -29,21 +29,12 @@ def _generation_from_path(path):
     return int(base[start:end])
 
 
-def _population_to_cpu(population):
-    return [
-        (M_A.detach().cpu(), M_B.detach().cpu())
-        for M_A, M_B in population
-    ]
+def _matrix_population_to_cpu(population):
+    return [M.detach().cpu() for M in population]
 
 
-def _population_to_device(population, device, dtype):
-    return [
-        (
-            M_A.to(device=device, dtype=dtype),
-            M_B.to(device=device, dtype=dtype),
-        )
-        for M_A, M_B in population
-    ]
+def _matrix_population_to_device(population, device, dtype):
+    return [M.to(device=device, dtype=dtype) for M in population]
 
 
 def clear_saved_checkpoints():
@@ -59,8 +50,7 @@ def save_checkpoint(
     best_fitness,
     population,
     history,
-    best_M_A,
-    best_M_B,
+    best_M,
     n,
     population_size,
     steps_per_eval,
@@ -69,19 +59,20 @@ def save_checkpoint(
 ):
     os.makedirs(DATA_DIR, exist_ok=True)
     filename = checkpoint_path(generation, best_fitness)
-    state = {
-        "generation": generation,
-        "population": _population_to_cpu(population),
-        "best_M_A": best_M_A.detach().cpu(),
-        "best_M_B": best_M_B.detach().cpu(),
-        "history": history,
-        "n": n,
-        "population_size": population_size,
-        "steps_per_eval": steps_per_eval,
-        "g": g,
-        "dt": dt,
-    }
-    torch.save(state, filename)
+    torch.save(
+        {
+            "generation": generation,
+            "best_M": best_M.detach().cpu(),
+            "population": _matrix_population_to_cpu(population),
+            "history": history,
+            "n": n,
+            "population_size": population_size,
+            "steps_per_eval": steps_per_eval,
+            "g": g,
+            "dt": dt,
+        },
+        filename,
+    )
 
 
 def load_latest_checkpoint(device, dtype):
@@ -93,20 +84,32 @@ def load_latest_checkpoint(device, dtype):
     files.sort(key=_generation_from_path, reverse=True)
     path = files[0]
     state = torch.load(path, map_location="cpu")
-    if "best_M_A" not in state or "best_M_B" not in state:
-        raise KeyError(
-            f"Checkpoint {path} has no best_M_A/best_M_B; "
-            "re-save from a newer training run"
-        )
-    population = _population_to_device(state["population"], device, dtype)
-    best_M_A = state["best_M_A"].to(device=device, dtype=dtype)
-    best_M_B = state["best_M_B"].to(device=device, dtype=dtype)
+
+    if "best_M" in state:
+        best_M = state["best_M"].to(device=device, dtype=dtype)
+    elif "best_M_A" in state:
+        best_M = state["best_M_A"].to(device=device, dtype=dtype)
+    else:
+        raise KeyError(f"Checkpoint {path} has no best_M or best_M_A")
+
+    if "population" in state and state["population"]:
+        first = state["population"][0]
+        if isinstance(first, tuple):
+            population = [
+                pair[0].to(device=device, dtype=dtype) for pair in state["population"]
+            ]
+        else:
+            population = _matrix_population_to_device(
+                state["population"], device, dtype
+            )
+    else:
+        raise KeyError(f"Checkpoint {path} has no population")
+
     return {
         "path": path,
         "generation": state["generation"],
+        "best_M": best_M,
         "population": population,
-        "best_M_A": best_M_A,
-        "best_M_B": best_M_B,
         "history": state["history"],
         "n": state["n"],
         "population_size": state["population_size"],

@@ -1,77 +1,83 @@
-# Quantum Coevolution
+# Quantum critical edge
 
-Minimal **closed**, unitary model: two coupled modes (truncated harmonic oscillators) with coevolved internal Hamiltonians \(H_A, H_B\), fixed beam-splitter coupling \(g\), and neuroevolution selecting for **regulated bipartite entanglement** \(f(S) = S(\ln n - S)\) (peak at \(S^* = \tfrac{1}{2}\ln n\)) plus mean score over each rollout from vacuum \|00⟩.
+Neuro-evolution searches for Hamiltonians at the **edge of chaos**: competing order and chaos pressures stay **balanced** while dynamics sustain that balance over time.
 
-**What this is:** bipartite exchange layer + explicit selection — correlation symbiosis, not dissipative heat/waste or multi-layer consolidation.
+## Setup
 
-**What this is not (yet):** open baths, per-mode entropy minimization, or extra “consolidator” fields. See **Thesis** and **Future extensions** in [quantum coevolution spec.md](quantum%20coevolution%20spec.md).
+- **Mode A (vacuum):** \(|0\rangle\), low entropy  
+- **Mode B (disorder):** seeded random state, high entropy  
+- **Initial:** \(|0\rangle_A \otimes |\psi_B^{\text{random}}\rangle\)  
+- **Genome:** matrix `M` → \(H=\frac{1}{2}(M+M^\dagger)\) on both modes + fixed beam coupling `G`
 
-## Requirements
+## Fitness
 
-- Python 3.10+
-- PyTorch 2.0+ (MPS on Apple Silicon, or CUDA/CPU)
-- scipy
-- matplotlib (only if using `--graph` or `--load`)
+### Balance skeleton (order × chaos − imbalance)
 
-Run commands from the **repository root** (`OrganismEvolution/`).
+\[
+F_{\text{bal}} = f_{\text{order}}\, f_{\text{chaos}} - \bigl|f_{\text{order}} - f_{\text{chaos}}\bigr|
+\]
 
-## Quick start
+High when **both** signals are present and similar; penalized when one dominates.
+
+### Static — \(F_{\text{static}}(H)\) (no time evolution)
+
+From local \(H\) eigenvalues:
+
+| Signal | Order \(f_{\text{order}}\) | Chaos \(f_{\text{chaos}}\) |
+|--------|---------------------------|----------------------------|
+| **Level-spacing ratio** \(r\) | near Poisson \(r\approx0.386\) | near Wigner–Dyson \(r\approx0.530\) |
+| **IPR** (eigenstate localization) | high IPR | low IPR |
+| **Spectral gap** | large gap / spread | small gap / spread |
+
+Primary proxy: mean \(r_n = \min(\delta_n,\delta_{n+1})/\max(\delta_n,\delta_{n+1})\) over spacings.  
+Target midpoint: \(r^* = \frac{1}{2}(r_{\text{Poisson}} + r_{\text{GOE}})\).
+
+### Dynamic — \(F_{\text{dynamic}}\) (rollout)
+
+From bipartite entanglement \(S(t)\) during rollout:
+
+- \(f_{\text{order}} \propto 1 - S/S_{\max}\) (area-law side)  
+- \(f_{\text{chaos}} \propto S/S_{\max}\) (volume-law side)  
+
+Same balance formula, time-averaged over steps (+ final term).
+
+### Total
+
+\[
+F = F_{\text{static}}(H) + \lambda\, F_{\text{dynamic}}(H)
+\]
+
+`DYNAMIC_LAMBDA` in `config.py` (default `0.3`).
+
+## Run
 
 ```bash
-# Neuroevolution (default: 10,000 generations)
 python3 -m quantum --train
-
-# Short smoke run
-python3 -m quantum --train --generations 10
-
-# Live matplotlib window (|ψ(x,y)|² + A/B drive heatmaps)
 python3 -m quantum --train --graph
-
-# Resume training from latest checkpoint in quantum/data/
-python3 -m quantum --train --load
-
-# Animate loaded best organism
 python3 -m quantum --load
-
-# Evolvability scaling experiment (random H pairs + short coevolution)
-python3 -m quantum --basin
+python3 -m quantum --demo
 ```
 
-Training prints a line every generation (`LOG_INTERVAL` in `quantum/config.py`). Each generation starts from the configured initial field (default **vacuum** |00⟩). Checkpoints are saved every generation as `quantum/data/quantum_gen{N}_{fitness}.pt`.
+## Config
 
-**Reference at n=16:** \(S^* \approx 1.386\) nats, max parabolic fitness \(\approx 1.922\). Logged `entanglement` is raw \(S\); fitness uses \(f(S)\) plus rollout mean.
+| Key | Role |
+|-----|------|
+| `R_POISSON`, `R_GOE` | Integrable vs chaotic spacing limits |
+| `DYNAMIC_LAMBDA` | Weight on rollout balance term (static spacing dominates when low) |
+| `POPULATION_SIZE` | Default `20` |
+| `MUTATION_RATE` | Default `0.1` |
+| `ELITISM_FREE_GENERATIONS` | First N generations use tournament refill only (no clone-best elitism) |
+| `DISORDER_SEED` | High-entropy wing B |
+| `G`, `DT`, `N` | Coupling, step, Fock cutoff |
 
-## Configuration
+## Logs
 
-Edit `quantum/config.py`:
-
-| Constant | Default | Meaning |
-|----------|---------|---------|
-| `N` | 16 | Fock-space truncation per organism |
-| `POPULATION_SIZE` | 50 | Evolution population |
-| `STEPS_PER_EVAL` | 100 | Rollout steps per fitness evaluation |
-| `POSITION_X_MAX` | 4.0 | Position grid extent for heatmaps (oscillator units) |
-| `INITIAL_STATE` | vacuum | `vacuum` or `random` product state each generation |
+```
+Gen     0 | fitness: 0.12 | F_static: 0.05 | F_dynamic: 0.07 | r: 0.45 | r*: 0.46 | f_ord: 0.52 | f_chaos: 0.48 | S: 0.31
+```
 
 ## Tests
 
 ```bash
 python3 -m pytest quantum/ -q
-```
-
-Checkpoints are not written during pytest runs.
-
-## Layout
-
-```
-quantum/
-  physics.py      # Hamiltonians, evolution, fitness
-  evolution.py    # Population training loop
-  checkpoint.py   # quantum/data/quantum_gen*.pt save/load
-  viz.py          # Position-space heatmaps (Fock → x,y)
-  grapher.py      # Live training UI
-  sim.py          # --load animation
-  basin.py        # Scaling experiment
-  config.py
-  data/           # Saved checkpoints (not used in tests)
 ```
