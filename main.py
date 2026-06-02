@@ -814,12 +814,6 @@ class Environment:
                 circle_mask = circle_mask.squeeze(0).squeeze(0)
                 circle_mask = circle_mask > 0
                 self.terrain[circle_mask] = self.terrain[circle_mask] + STARTING_POSITION_TERRAIN_BOOST
-        
-        elif self.environment_type == 3:
-            # Type 3: Update moving perlin noise
-            self.time += PERLIN_TIME_SPEED
-            self.terrain = self._generate_perlin_terrain()
-            
 
 class OrganismManager:
     def __init__(self, world_size, organism_count, terrain):
@@ -829,7 +823,7 @@ class OrganismManager:
         self.positions = torch.tensor(ORGANISM_POSITIONS, dtype=torch.long, device=device)
         self.topology_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
         self.energy_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
-        self.sharing_rate_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
+        self.sharing_rate_matrix = torch.full((world_size, world_size), SHARING_OFF_VALUE, dtype=torch.float32, device=device)
         self.hidden_channels = torch.zeros((1, world_size, world_size), dtype=torch.float32, device=device)
         self.rotation_matrix = torch.zeros((world_size, world_size), dtype=torch.float32, device=device)
         self.parent_giver_dir = torch.full((world_size, world_size), -1, dtype=torch.long, device=device)
@@ -921,7 +915,7 @@ class OrganismManager:
             y_coords, x_coords = self.positions[:, 1], self.positions[:, 0]
             self.topology_matrix[y_coords, x_coords] = 1
             self.energy_matrix[y_coords, x_coords] = 1
-            self.sharing_rate_matrix[y_coords, x_coords] = float(ENERGY_SHARING_RATE > 0)
+            self.sharing_rate_matrix[y_coords, x_coords] = SHARING_ON_VALUE if ENERGY_SHARING_RATE > 0 else SHARING_OFF_VALUE
             self.hidden_channels[:, y_coords, x_coords] = 0
             self.rotation_matrix[y_coords, x_coords] = 0
     
@@ -936,7 +930,10 @@ class OrganismManager:
         energy_mask = self.new_cell_candidates & (self.pending_birth_energy >= self.reproduction_threshold)
         
         # Parent, rotation, and sharing rate (from parent hidden state) for new cells
-        child_sharing_rate = torch.full_like(self.sharing_rate_matrix, float(ENERGY_SHARING_RATE > 0))
+        child_sharing_rate = torch.full_like(
+            self.sharing_rate_matrix,
+            SHARING_ON_VALUE if ENERGY_SHARING_RATE > 0 else SHARING_OFF_VALUE,
+        )
         if self.new_cell_contributions is not None:
             contrib_by_giver_dir = self._gather_inbound_by_giver_dir(self.new_cell_contributions)
             total_weight = contrib_by_giver_dir.sum(dim=0)
@@ -948,7 +945,12 @@ class OrganismManager:
             self.rotation_matrix[birth_mask] = snapped_angles[birth_mask]
             parent_hidden_by_g = self.hidden_channels[0, self._giver_source_y, self._giver_source_x]
             child_hidden = parent_hidden_by_g.gather(0, dominant_giver_dir.unsqueeze(0).clamp(min=0)).squeeze(0)
-            child_sharing_rate = torch.where(birth_mask, child_hidden, child_sharing_rate)
+            # Map binary hidden (0/1) into sharing rates (OFF=0.1, ON=0.9)
+            child_sharing_rate = torch.where(
+                birth_mask,
+                SHARING_OFF_VALUE + child_hidden * (SHARING_ON_VALUE - SHARING_OFF_VALUE),
+                child_sharing_rate,
+            )
         
         # Add selected positions to topology and commit birth energy
         self.topology_matrix[energy_mask] = 1
@@ -968,7 +970,7 @@ class OrganismManager:
         self._tick_destroyed += (self.energy_matrix * low_energy_mask.float()).sum()
         self.energy_matrix[low_energy_mask] = 0
         self.topology_matrix[low_energy_mask] = 0
-        self.sharing_rate_matrix[low_energy_mask] = 0
+        self.sharing_rate_matrix[low_energy_mask] = SHARING_OFF_VALUE
         self.hidden_channels[:, low_energy_mask] = 0
         self.rotation_matrix[low_energy_mask] = 0
         self.parent_giver_dir[low_energy_mask] = -1
@@ -979,8 +981,7 @@ class OrganismManager:
         # Decay: sparse organism neighborhood + low local terrain → higher loss
         energy_unsqueezed = self.energy_matrix.unsqueeze(0).unsqueeze(0)
         org_avg = torch.nn.functional.conv2d(energy_unsqueezed, self._org_avg_weight, padding=1).squeeze(0).squeeze(0)
-        decay_amount = ENERGY_DENSITY_DECAY_MODIFIER * self.sharing_rate_matrix**2 * (1.0 - org_avg) * (1.0 - self.terrain)
-        cell_decay = (decay_amount + ENERGY_DECAY) * self.topology_matrix
+        cell_decay = torch.clamp(self.sharing_rate_matrix**3 * (1.0 - org_avg)**2 * ENERGY_DECAY * self.topology_matrix, 0, 1)   
         energy_after_harvest = self.energy_matrix + harvested_energy
         energy_before_decay = energy_after_harvest * self.topology_matrix
         self.energy_matrix = torch.clamp((energy_after_harvest - cell_decay) * self.topology_matrix, 0, 1)
@@ -1219,7 +1220,6 @@ class Renderer:
             f"Energy Decay: {ENERGY_DECAY:.4f}",
             f"Reproduction Threshold: {REPRODUCTION_THRESHOLD:.4f}",
             f"Death Threshold: {DEATH_THRESHOLD:.4f}",
-            f"Energy Density Decay Modifier: {ENERGY_DENSITY_DECAY_MODIFIER}",
             f"Seed Boost: {STARTING_POSITION_TERRAIN_BOOST}",
             f"",
             f"=== SIMULATION STATE ===",
