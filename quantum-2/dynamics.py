@@ -1,7 +1,8 @@
 import numpy as np
 from scipy.linalg import expm
 
-from hamiltonian import build_hamiltonian, sum_pauli_x
+from dissipation import damping_ops_on_a, rk4_lindblad_step
+from hamiltonian import build_hamiltonian, sum_pauli_x_b
 
 
 def vacuum_state(n_qubits):
@@ -25,46 +26,19 @@ def initial_state(n_qubits, kind, seed):
     raise ValueError(f"unknown initial state: {kind}")
 
 
-def propagate(H, psi0, dt, n_steps):
-    states = [psi0.copy()]
-    psi = psi0.copy()
-    for _ in range(n_steps):
-        U = expm(-1j * H * dt)
-        psi = U @ psi
-        states.append(psi)
-    return states
-
-
-def propagate_driven(H, H_drive, psi0, dt, n_steps, drive_amp, drive_omega):
-    states = [psi0.copy()]
-    psi = psi0.copy()
-    for step in range(n_steps):
-        t = step * dt
-        H_eff = H + drive_amp * np.cos(drive_omega * t) * H_drive
-        U = expm(-1j * H_eff * dt)
-        psi = U @ psi
-        states.append(psi)
-    return states
-
-
-def _n_qubits_from_psi(psi):
-    n = int(np.log2(psi.size))
-    if 2**n != psi.size:
-        raise ValueError("psi length must be a power of 2")
-    return n
-
-
-def probability_grid(psi, n_a):
-    n_qubits = _n_qubits_from_psi(psi)
-    n_b = n_qubits - n_a
+def grid_from_rho(rho, n_a):
+    n_qubits = int(np.log2(rho.shape[0]))
     dim_a = 2**n_a
-    dim_b = 2**n_b
-    amp = psi.reshape(dim_a, dim_b)
-    return np.abs(amp) ** 2
+    dim_b = 2**n_qubits // dim_a
+    grid = np.zeros((dim_a, dim_b), dtype=float)
+    for a in range(dim_a):
+        for b in range(dim_b):
+            idx = a * dim_b + b
+            grid[a, b] = float(np.real(rho[idx, idx]))
+    return grid
 
 
-def transfer_metrics(psi, n_a, lambda_a):
-    grid = probability_grid(psi, n_a)
+def transfer_metrics_from_grid(grid, lambda_a):
     p_b_exc = float(1.0 - grid[:, 0].sum())
     p_a_exc = float(grid[1:, :].sum())
     transfer = p_b_exc - lambda_a * p_a_exc
@@ -75,16 +49,38 @@ def transfer_metrics(psi, n_a, lambda_a):
     }
 
 
-def bipartition_entropy(psi, n_a):
-    n_qubits = _n_qubits_from_psi(psi)
-    n_b = n_qubits - n_a
+def partial_trace_b(rho, n_a):
+    n_qubits = int(np.log2(rho.shape[0]))
     dim_a = 2**n_a
-    dim_b = 2**n_b
-    amp = psi.reshape(dim_a, dim_b)
-    rho_a = amp @ amp.conj().T
+    dim_b = 2**n_qubits // dim_a
+    rho_t = rho.reshape(dim_a, dim_b, dim_a, dim_b)
+    rho_a = np.trace(rho_t, axis1=1, axis2=3)
+    return rho_a
+
+
+def bipartition_entropy_rho(rho, n_a):
+    rho_a = partial_trace_b(rho, n_a)
     eigenvalues = np.linalg.eigvalsh(rho_a)
     eigenvalues = eigenvalues[eigenvalues > 1e-12]
     return float(-np.sum(eigenvalues * np.log(eigenvalues)))
+
+
+def psi_to_rho(psi):
+    return np.outer(psi, psi.conj())
+
+
+def propagate_open(H, H_drive, psi0, dt, n_steps, drive_amp, drive_omega, gamma, n_a):
+    jump_ops = damping_ops_on_a(int(np.log2(psi0.size)), n_a)
+    rho = psi_to_rho(psi0)
+    rhos = [rho.copy()]
+    for step in range(n_steps):
+        t = step * dt
+        H_eff = H + drive_amp * np.cos(drive_omega * t) * H_drive
+        U = expm(-1j * H_eff * dt)
+        rho = U @ rho @ U.conj().T
+        rho = rk4_lindblad_step(rho, np.zeros_like(H), jump_ops, gamma, dt)
+        rhos.append(rho)
+    return rhos
 
 
 def run_rollout(
@@ -94,31 +90,33 @@ def run_rollout(
     n_steps,
     initial,
     seed,
-    drive_amp=0.0,
-    drive_omega=0.0,
+    drive_amp,
+    drive_omega,
+    dissipation_gamma,
 ):
     H = build_hamiltonian(genome, n_qubits)
     psi0 = initial_state(n_qubits, initial, seed)
-    if drive_amp != 0.0:
-        H_drive = sum_pauli_x(n_qubits)
-        states = propagate_driven(
-            H, H_drive, psi0, dt, n_steps, drive_amp, drive_omega
-        )
-    else:
-        H_drive = None
-        states = propagate(H, psi0, dt, n_steps)
     n_a = n_qubits // 2
-    entropies = [bipartition_entropy(psi, n_a) for psi in states]
-    grids = [probability_grid(psi, n_a) for psi in states]
+    H_drive = sum_pauli_x_b(n_qubits, n_a)
+    rhos = propagate_open(
+        H,
+        H_drive,
+        psi0,
+        dt,
+        n_steps,
+        drive_amp,
+        drive_omega,
+        dissipation_gamma,
+        n_a,
+    )
+    entropies = [bipartition_entropy_rho(rho, n_a) for rho in rhos]
+    grids = [grid_from_rho(rho, n_a) for rho in rhos]
     return {
         "H": H,
-        "H_drive": H_drive,
-        "states": states,
+        "rhos": rhos,
         "entropies": entropies,
         "grids": grids,
         "n_a": n_a,
         "dt": dt,
         "n_steps": n_steps,
-        "drive_amp": drive_amp,
-        "drive_omega": drive_omega,
     }

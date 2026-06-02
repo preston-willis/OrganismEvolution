@@ -7,11 +7,18 @@ Z = np.array([[1, 0], [0, -1]])
 PAULIS = {"I": I, "X": X, "Y": Y, "Z": Z}
 
 
+def pad_genome(genome, n_qubits):
+    padded = []
+    for coeff, pstring in genome:
+        if len(pstring) > n_qubits:
+            continue
+        if len(pstring) < n_qubits:
+            pstring = pstring + "I" * (n_qubits - len(pstring))
+        padded.append((coeff, pstring))
+    return padded
+
+
 def build_hamiltonian(genome, n_qubits):
-    """
-    genome: list of (coefficient, pauli_string) tuples
-    e.g. [(0.5, 'XZIY'), (-0.3, 'ZZII')]
-    """
     dim = 2**n_qubits
     H = np.zeros((dim, dim), dtype=complex)
     for coeff, pstring in genome:
@@ -22,11 +29,10 @@ def build_hamiltonian(genome, n_qubits):
     return H
 
 
-def sum_pauli_x(n_qubits):
-    """Drive operator: uniform transverse field sum_i X_i."""
+def sum_pauli_x_b(n_qubits, n_a):
     dim = 2**n_qubits
     H = np.zeros((dim, dim), dtype=complex)
-    for q in range(n_qubits):
+    for q in range(n_a, n_qubits):
         term = np.array([[1.0]])
         for k in range(n_qubits):
             term = np.kron(term, PAULIS["X" if k == q else "I"])

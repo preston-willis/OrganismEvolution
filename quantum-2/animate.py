@@ -5,9 +5,9 @@ import matplotlib.animation as animation
 import matplotlib.pyplot as plt
 import numpy as np
 
-from dynamics import run_rollout
-from hamiltonian import build_hamiltonian
-from critical_report import pad_genome
+from config import S_TARGET, TRANSFER_LAMBDA
+from dynamics import run_rollout, transfer_metrics_from_grid
+from hamiltonian import pad_genome
 
 
 def load_genome(path):
@@ -27,8 +27,9 @@ def run_animation(
     show,
     save_path,
     frame_ms,
-    drive_amp=0.0,
-    drive_omega=0.0,
+    drive_amp,
+    drive_omega,
+    dissipation_gamma,
 ):
     genome = pad_genome(genome, n_qubits)
     rollout = run_rollout(
@@ -40,6 +41,7 @@ def run_animation(
         seed,
         drive_amp=drive_amp,
         drive_omega=drive_omega,
+        dissipation_gamma=dissipation_gamma,
     )
     grids = rollout["grids"]
     entropies = rollout["entropies"]
@@ -47,7 +49,10 @@ def run_animation(
     n_b = n_qubits - n_a
     steps = list(range(len(entropies)))
 
-    # Avoid frame-0 vacuum spike and rare near-product revivals pinning vmax≈1.
+    transfers = [
+        transfer_metrics_from_grid(g, TRANSFER_LAMBDA)["transfer"] for g in grids
+    ]
+
     if initial == "vacuum" and len(grids) > 1:
         pooled = np.concatenate([g.ravel() for g in grids[1:]])
         vmax = float(np.percentile(pooled, 99.5))
@@ -57,25 +62,18 @@ def run_animation(
     if vmax < 1e-12:
         vmax = 1.0
 
-    from dynamics import transfer_metrics
-    from config import TRANSFER_LAMBDA
-
-    final_tm = transfer_metrics(rollout["states"][-1], n_a, TRANSFER_LAMBDA)
+    final_tm = transfer_metrics_from_grid(grids[-1], TRANSFER_LAMBDA)
     print(
-        f"Heatmap scale vmax={vmax:.4f} | "
-        f"peak|ψ|² frame0={np.max(grids[0]):.4f} final={np.max(grids[-1]):.4f} | "
-        f"p_B={final_tm['p_b_exc']:.4f} p_A={final_tm['p_a_exc']:.4f}"
+        f"Heatmap vmax={vmax:.4f} | final S={entropies[-1]:.4f} | "
+        f"p_B={final_tm['p_b_exc']:.4f} p_A={final_tm['p_a_exc']:.4f} "
+        f"transfer={final_tm['transfer']:.4f}"
     )
 
     fig, (ax_field, ax_s) = plt.subplots(1, 2, figsize=(10, 4))
-    if drive_amp != 0.0:
-        title = (
-            f"Critical H + drive  "
-            f"A={drive_amp} cos({drive_omega}t) sum X_i"
-        )
-    else:
-        title = "Critical Hamiltonian — field self-organization"
-    fig.suptitle(title, fontsize=11)
+    fig.suptitle(
+        f"H + B-pump A={drive_amp} cos({drive_omega}t) | gamma={dissipation_gamma} on A",
+        fontsize=11,
+    )
 
     im = ax_field.imshow(
         grids[0],
@@ -87,16 +85,21 @@ def run_animation(
     )
     ax_field.set_xlabel(f"subsystem B ({n_b} qubits)")
     ax_field.set_ylabel(f"subsystem A ({n_a} qubits)")
-    ax_field.set_title("|ψ|² on A⊗B")
-    fig.colorbar(im, ax=ax_field, fraction=0.046, label="|ψ|²")
+    ax_field.set_title("|ρ|² on A⊗B")
+    fig.colorbar(im, ax=ax_field, fraction=0.046, label="diag ρ")
 
-    (line_s,) = ax_s.plot([], [], color="C1", linewidth=2)
+    (line_s,) = ax_s.plot([], [], color="C1", linewidth=2, label="S")
+    (line_t,) = ax_s.plot([], [], color="C0", linewidth=1.5, label="transfer")
+    ax_s.axhline(S_TARGET, color="C1", linestyle="--", alpha=0.5, linewidth=1)
     ax_s.set_xlim(0, n_steps)
-    s_max = max(entropies)
-    ax_s.set_ylim(0, s_max * 1.1 if s_max > 1e-12 else 1.0)
+    y_hi = max(max(entropies), max(transfers), S_TARGET) * 1.1
+    if y_hi < 1e-12:
+        y_hi = 1.0
+    ax_s.set_ylim(0, y_hi)
     ax_s.set_xlabel("step")
-    ax_s.set_ylabel("S (entanglement)")
-    ax_s.set_title("Bipartite entanglement entropy")
+    ax_s.set_ylabel("S / transfer")
+    ax_s.set_title("Entanglement & transfer")
+    ax_s.legend(loc="lower right", fontsize=8)
     ax_s.grid(True, alpha=0.3)
 
     time_text = ax_field.text(
@@ -112,8 +115,9 @@ def run_animation(
     def update(frame):
         im.set_data(grids[frame])
         line_s.set_data(steps[: frame + 1], entropies[: frame + 1])
+        line_t.set_data(steps[: frame + 1], transfers[: frame + 1])
         time_text.set_text(f"t = {frame * dt:.3f}")
-        return im, line_s, time_text
+        return im, line_s, line_t, time_text
 
     ani = animation.FuncAnimation(
         fig,
@@ -136,23 +140,3 @@ def run_animation(
         plt.close(fig)
 
     return rollout
-
-
-def main_from_cli(genome_path, dt, n_steps, initial, seed, show, save_path, frame_ms):
-    genome, n_qubits = load_genome(genome_path)
-    genome = pad_genome(genome, n_qubits)
-    eigs = np.linalg.eigvalsh(build_hamiltonian(genome, n_qubits))
-    span = float(eigs[-1] - eigs[0])
-    print(f"Loaded {genome_path} | N={n_qubits} | spectral span ≈ {span:.3f}")
-    print(f"Rollout: dt={dt} steps={n_steps} initial={initial}")
-    run_animation(
-        genome,
-        n_qubits,
-        dt,
-        n_steps,
-        initial,
-        seed,
-        show,
-        save_path,
-        frame_ms,
-    )
