@@ -128,10 +128,33 @@ Returns `(proportions, sharing_rate_output, hidden_channels_output)`.
 ## `_release_device_memory(torch_device)`
 - Calls `gc.collect()` and device `empty_cache()` for mps/cuda.
 
-## `_evaluate_cnn_worker(args)` → `(total_cell_count, tick_data)`
-- **Args:** `(cpu_state_dict, world_size, max_time, bot_index, collect_tick_data)`.
-- Builds CNN + `Simulation(enable_debug=False)`, runs up to `max_time` ticks.
-- Fitness = sum of cell counts over ticks; early stop if cells = 0.
+## Fitness modes (`CNN_FITNESS_MODE` in config.py, `--fitness-mode` CLI)
+
+| Mode | Fitness per rollout | Selects for |
+|------|---------------------|-------------|
+| `cell_count` (default) | Sum of alive cells each tick | Growth / expansion |
+| `entropy_production` | Sum of `destroyed_energy` gained per tick | Dissipation |
+| `persistence` | Ticks alive before extinction | Survival on uniform terrain set once (`CNN_FITNESS_PERSISTENCE_TERRAIN`) |
+| `life_like` | `∫σ̇ − λ·ΔS_config` | `λ = CNN_FITNESS_LIFE_LIKE_ORDER_WEIGHT`; zero fitness if `∫σ̇ < CNN_FITNESS_LIFE_LIKE_ENTROPY_FLOOR` when floor > 0 |
+
+`run_cnn_fitness_rollout(sim, max_time, fitness_mode=...)` centralizes evaluation. Interactive sim unchanged.
+
+`compare_fitness_modes.py` runs one CNN under all three modes for side-by-side comparison.
+
+## Colony lineage mutations (`--lineage`)
+
+- `apply_loaded_cnn(organism_manager, cnn)` attaches weights only (`--load`).
+- `configure_organism_manager_from_args` calls `enable_colony_mutation()` when `--lineage` is set.
+- If `topology_matrix.sum() == 0` after a tick, `reseed_organism_positions_if_extinct()` places seeds again at the run's initial random `seed_positions`.
+- `ColonyMutationGraph`: `genome_id_field` + `genomes` dict. Crossover (50/50 blend) then `(I+delta)@T` only if an alive 8-neighbor has a different genome; else inherit parent `T`. Colors: 3×121 projection of flattened transform (similar → similar RGB). Tab: genome overlay + colored cells.
+- Forward applies transforms only on `topology & non_identity_mask` via `apply_lineage_mutation_logits` (not full-grid einsum).
+- Births use same parent as `parent_giver_dir` via `_giver_source_y/x`; each `--lineage` seed gets `sample_seed_genome_transform()` (random `I + noise`); death clears `cell_id` and resets local transform to `I`.
+- `CNN_MUTATION_RATE` / `CNN_MUTATION_MAGNITUDE` from config (same as GA). Training `--load` does not enable this (interactive/reload only).
+
+## `_evaluate_cnn_worker(args)` → `(fitness, tick_data)`
+- **Args:** `(cpu_state_dict, world_size, max_time, bot_index, collect_tick_data, fitness_mode)`.
+- Builds CNN + `Simulation(enable_debug=False)`, runs `run_cnn_fitness_rollout`.
+- Early stop if cells = 0.
 - If `collect_tick_data`, records every 10th tick metrics tuple.
 - Deletes sim/cnn; calls `_release_device_memory`.
 
@@ -154,8 +177,8 @@ Returns `(proportions, sharing_rate_output, hidden_channels_output)`.
 - Calls `_release_device_memory(self.device)`.
 
 ### `_evaluate_single_cnn(simulation, bot_index=None)` → float
-- Runs `max_time` ticks on given simulation (single process).
-- Fitness = cumulative cell count; optional grapher enqueue every 10 ticks.
+- Runs `run_cnn_fitness_rollout` on given simulation (single process).
+- Optional grapher enqueue every 10 ticks.
 
 ---
 
@@ -218,7 +241,7 @@ Grid state: topology, energy, sharing_rate, hidden `(1,H,W)`, rotation, parent_g
   along channel `(g+4)%8`.
 
 ### `_initialize_topology()`
-- Places seeds from `ORGANISM_POSITIONS`: topology=1, energy=1, sharing=`ENERGY_SHARING_RATE>0`, hidden=0, rotation=0.
+- `Simulation` draws `ORGANISM_COUNT` distinct random cells via `random_organism_positions`; same list seeds organisms and env type-1 boosts.
 
 ### `compute_topology()`
 - No-op if no `new_cell_candidates`.
@@ -227,15 +250,18 @@ Grid state: topology, energy, sharing_rate, hidden `(1,H,W)`, rotation, parent_g
 - **Birth side effects (when total inbound weight > 0):**
   - `parent_giver_dir` = dominant giver direction
   - `rotation_matrix` = snapped angle so local N opposes giver
-  - `sharing_rate` = parent `hidden_channels[0]` at birth (0 or 1)
-- Sets topology=1; hidden=0 for new cells.
+  - `sharing_rate` = `SHARING_OFF` + parent hidden × (`SHARING_ON` − `SHARING_OFF`)
+  - `hidden_channels[0]` = parent hidden at dominant giver (same value as used for sharing)
+- Sets topology=1; births without giver data keep default sharing and hidden=0.
 - Fallback sharing if no giver data: `ENERGY_SHARING_RATE > 0`.
 
 ### `_apply_harvest_and_decay(terrain)` → `harvested_energy`
 - Cells with `energy < DEATH_THRESHOLD` removed (all state cleared, parent=-1).
 - Harvest: `min(terrain, sharing_rate * ENERGY_HARVEST_RATE)`.
 - Death: cells below `DEATH_THRESHOLD` removed; their energy added to `destroyed_energy` and cleared from `energy_matrix`.
-- Decay: `(ENERGY_DENSITY_DECAY_MODIFIER × sharing_rate² × (1 - avg_neighbor_organism_energy) × (1 - local_terrain) + ENERGY_DECAY) × topology`; set `ENERGY_DENSITY_DECAY_MODIFIER = 0` to disable density/terrain-modulated decay; energy removed added to `destroyed_energy`.
+- Harvest (Onsager): `X = μ_org − μ_terrain`, `L = (ENERGY_HARVEST_RATE/T_env) × sharing_rate`, `σ̇ = LX²`, `ΔE = min(terrain, 1−e, T_env σ̇)`; `destroyed_entropy += σ̇`.
+- Decay (Onsager): `L = (ENERGY_DECAY/T_env) × sharing_rate³ × (1-org_avg)²`, `σ̇ = Lμ_org²`, `ΔE = min(e, T_env σ̇)`; `destroyed_entropy += ΔE/T_env`.
+- System entropy (config + bath): `S_org + S_terrain + S_pending + destroyed_energy/T_env`. Cumulative `destroyed_entropy` = ∫σ̇ dt (fitness in entropy_production mode).
 - Energy clamped [0,1] on alive cells.
 
 ### `_compute_energy_contributions(shareable, proportions)` → `(3,3,H,W)`
@@ -283,7 +309,7 @@ Intended bookkeeping (what tests assert):
 | **Capacity** | No cell exceeds 1.0; `actual_received <= 1 - energy`. |
 | **Parent-only income** | Children use `shareable + parent_incoming`, not full neighbor sum. |
 | **Seed income** | Seeds use `distributed_total = shareable` → zero sharing income. |
-| **Decay / death sink** | Energy removed by decay or death is accumulated in `OrganismManager.destroyed_energy` (inaccessible bucket). |
+| **Decay / death sink** | Energy → `destroyed_energy`; entropy production → `destroyed_entropy` with `ΔS = ΔE/T_env`. |
 | **Total energy** | `sum(energy_matrix) + sum(terrain) + sum(pending_birth_energy) + destroyed_energy` conserved each tick. |
 | **Harvest** | `harvested = min(terrain, sharing_rate × ENERGY_HARVEST_RATE)`; terrain loses same `harvested` per cell. |
 

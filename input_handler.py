@@ -22,6 +22,7 @@ class InputHandler:
         print("  'r' - Toggle replay mode (show best organism from training)")
         print("  'd' - Toggle debug text overlay")
         print("  'v' - Toggle large dots (10x size)")
+        print("  Tab - Toggle genome view (requires --lineage)")
         print("  'p' - Toggle performance mode (disable expensive rendering)")
         print("  Ctrl+C - Force quit")
         print("  Click on the window to focus for keyboard input")

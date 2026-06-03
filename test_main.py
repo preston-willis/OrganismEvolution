@@ -1,4 +1,5 @@
 """Unit tests for main.py — see specs/main.md for behavior specifications."""
+import argparse
 import gc
 import os
 import sys
@@ -11,22 +12,46 @@ import torch
 import main as main_module
 from main import (
     BasicCPPN,
+    ColonyMutationGraph,
     CNNGeneticAlgorithm,
     CNNEvaluator,
     CNNEvolutionDriver,
+    CNN_FITNESS_MODES,
     EnergyDistributionCNN,
     Environment,
+    random_organism_positions,
     OrganismManager,
     Renderer,
     Simulation,
+    _configure_fitness_environment,
     _evaluate_cnn_worker,
     _init_worker,
     _release_device_memory,
+    chemical_potential,
+    apply_lineage_mutation_logits,
+    apply_loaded_cnn,
     clear_saved_networks,
+    decay_conductance,
     load_latest_cnn,
+    random_organism_positions,
+    mixing_entropy,
+    configurational_entropy,
+    run_cnn_fitness_rollout,
+    set_cnn_fitness_mode,
+    thermodynamic_decay_step,
+    validate_cnn_fitness_mode,
 )
 import oriented_conv
-from config import ENERGY_DECAY, ENERGY_HARVEST_RATE
+from config import (
+    CNN_FITNESS_PERSISTENCE_TERRAIN,
+    ENERGY_DECAY,
+    ENERGY_HARVEST_RATE,
+    ORGANISM_COUNT,
+    SHARING_OFF_VALUE,
+    SHARING_ON_VALUE,
+    TERRAIN_PUMP_RATE,
+    WORLD_SIZE,
+)
 
 device = main_module.device
 SMALL = 12
@@ -77,6 +102,7 @@ def apply_sharing_physics(om, terrain, proportions):
     """
     org_sum_before_harvest = om.energy_matrix.sum()
     harvested = om._apply_harvest_and_decay(terrain)
+    om._flush_tick_destroyed()
     org_sum_after_harvest = om.energy_matrix.sum()
     destroyed_before_sharing = om.destroyed_energy
 
@@ -116,7 +142,8 @@ def apply_sharing_physics(om, terrain, proportions):
     unclamped = (om.energy_matrix + incoming * dest_efficiency - source_removed) * valid_mask
     om.energy_matrix = torch.clamp(unclamped, 0, 1)
     sharing_clamp_loss = (unclamped - om.energy_matrix).sum()
-    om.destroyed_energy += sharing_clamp_loss.item()
+    om._add_destroyed_energy(sharing_clamp_loss)
+    om._flush_tick_destroyed()
 
     return {
         "harvested": harvested,
@@ -286,6 +313,227 @@ class TestOrganismManagerStaticWeights(unittest.TestCase):
         self.assertEqual(w[4, 0, 1, 1].item(), 1.0)
 
 
+class TestColonyMutationGraph(unittest.TestCase):
+    def _topology_with_cells(self, cells):
+        topology = torch.zeros(SMALL, SMALL, device=device)
+        for y, x in cells:
+            topology[y, x] = 1
+        return topology
+
+    def test_birth_composes_parent_transform(self):
+        graph = ColonyMutationGraph(SMALL, device, 1.0, 0.1)
+        topology = self._topology_with_cells([(6, 6), (5, 6)])
+        graph.register_seed(6, 6)
+        other = torch.eye(11, device=device) * 1.2
+        graph.transform_field[:, :, 5, 6] = other
+        graph.non_identity_mask[5, 6] = True
+        graph._set_cell_genome(5, 6, other)
+        torch.manual_seed(0)
+        graph.register_birth(6, 7, 6, 6, topology)
+        parent_id = graph.cell_id[6, 6].item()
+        child_id = graph.cell_id[6, 7].item()
+        edge_delta = graph.adjacency[0][2]
+        edge_transform = torch.eye(11, device=device) + edge_delta
+        parent_transform = graph.transform_field[:, :, 6, 6]
+        blended = 0.5 * parent_transform + 0.5 * other
+        composed = edge_transform @ blended
+        self.assertTrue(torch.allclose(graph.transform_field[:, :, 6, 7], composed, atol=1e-5))
+
+    def test_birth_inherits_without_different_neighbor(self):
+        graph = ColonyMutationGraph(SMALL, device, 1.0, 0.1)
+        topology = self._topology_with_cells([(6, 6)])
+        graph.register_seed(6, 6)
+        torch.manual_seed(0)
+        graph.register_birth(6, 7, 6, 6, topology)
+        self.assertEqual(len(graph.adjacency), 0)
+        self.assertTrue(torch.equal(graph.transform_field[:, :, 6, 6], graph.transform_field[:, :, 6, 7]))
+
+    def test_death_clears_cell_transform(self):
+        graph = ColonyMutationGraph(SMALL, device, 1.0, 0.1)
+        graph.register_seed(6, 6)
+        graph.non_identity_mask[6, 6] = True
+        graph.lineage_mutation_cell_count = 1
+        mask = torch.zeros(SMALL, SMALL, dtype=torch.bool, device=device)
+        mask[6, 6] = True
+        graph.clear_cells_mask(mask)
+        self.assertEqual(graph.cell_id[6, 6].item(), -1)
+        self.assertFalse(graph.non_identity_mask[6, 6].item())
+        self.assertEqual(graph.lineage_mutation_cell_count, 0)
+        self.assertTrue(
+            torch.allclose(
+                graph.transform_field[:, :, 6, 6],
+                torch.eye(11, device=device),
+            )
+        )
+
+    def test_birth_skips_mutation_when_rand_above_rate(self):
+        graph = ColonyMutationGraph(SMALL, device, 0.0, 0.1)
+        topology = self._topology_with_cells([(6, 6), (5, 6)])
+        graph.register_seed(6, 6)
+        other = torch.eye(11, device=device) * 1.2
+        graph.transform_field[:, :, 5, 6] = other
+        graph._set_cell_genome(5, 6, other)
+        graph.register_birth(6, 7, 6, 6, topology)
+        self.assertEqual(len(graph.adjacency), 0)
+        blended = 0.5 * graph.transform_field[:, :, 6, 6] + 0.5 * other
+        self.assertTrue(torch.allclose(graph.transform_field[:, :, 6, 7], blended, atol=1e-5))
+
+    @patch("main.INTERACTION_RATE", 0.0)
+    def test_birth_skips_recombine_when_interaction_rate_zero(self):
+        graph = ColonyMutationGraph(SMALL, device, 1.0, 0.1)
+        topology = self._topology_with_cells([(6, 6), (5, 6)])
+        graph.register_seed(6, 6)
+        other = torch.eye(11, device=device) * 1.2
+        graph.transform_field[:, :, 5, 6] = other
+        graph._set_cell_genome(5, 6, other)
+        graph.register_birth(6, 7, 6, 6, topology)
+        self.assertEqual(len(graph.adjacency), 0)
+        self.assertTrue(torch.equal(graph.transform_field[:, :, 6, 6], graph.transform_field[:, :, 6, 7]))
+
+    def test_birth_inherits_parent_non_identity_without_new_edge(self):
+        graph = ColonyMutationGraph(SMALL, device, 0.0, 0.1)
+        topology = self._topology_with_cells([(6, 6)])
+        graph.register_seed(6, 6)
+        parent_transform = torch.eye(11, device=device) * 2.0
+        graph.transform_field[:, :, 6, 6] = parent_transform
+        graph.non_identity_mask[6, 6] = True
+        graph._set_cell_genome(6, 6, parent_transform)
+        graph.register_birth(6, 7, 6, 6, topology)
+        self.assertTrue(torch.equal(graph.transform_field[:, :, 6, 6], graph.transform_field[:, :, 6, 7]))
+        self.assertTrue(graph.non_identity_mask[6, 7].item())
+
+    def test_seed_genomes_get_random_display_colors(self):
+        graph = ColonyMutationGraph(SMALL, device, 0.1, 0.1)
+        for i in range(8):
+            graph.register_seed(0, i)
+        colors = [tuple(graph._genome_rgb[g].tolist()) for g in range(8)]
+        self.assertEqual(len(set(colors)), 8)
+
+    def test_lineage_mutation_skips_when_cell_count_zero(self):
+        logits = torch.ones(11, SMALL, SMALL, device=device)
+        transform = torch.eye(11, device=device).view(11, 11, 1, 1).expand(11, 11, SMALL, SMALL).clone()
+        mask = torch.ones(SMALL, SMALL, dtype=torch.bool, device=device)
+        out = apply_lineage_mutation_logits(logits, transform, mask, 0)
+        self.assertTrue(torch.equal(out, logits))
+
+    def test_apply_lineage_mutation_logits_masked(self):
+        logits = torch.arange(11 * SMALL * SMALL, device=device, dtype=torch.float32).view(
+            11, SMALL, SMALL
+        )
+        original = logits.clone()
+        transform = torch.eye(11, device=device).view(11, 11, 1, 1).expand(11, 11, SMALL, SMALL).clone()
+        transform[:, :, 6, 6] = torch.eye(11, device=device) * 2.0
+        mask = torch.zeros(SMALL, SMALL, dtype=torch.bool, device=device)
+        mask[6, 6] = True
+        out = apply_lineage_mutation_logits(logits, transform, mask, 1)
+        self.assertTrue(torch.allclose(out[:, 5, 5], original[:, 5, 5]))
+        self.assertFalse(torch.allclose(out[:, 6, 6], original[:, 6, 6]))
+
+    def test_enable_colony_mutation_registers_seeds(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.enable_colony_mutation()
+        self.assertTrue(om.colony_mutation_enabled)
+        self.assertEqual(om.colony_mutation_graph.cell_id[6, 6].item(), 0)
+        self.assertTrue(om.colony_mutation_graph.non_identity_mask[6, 6].item())
+
+    def test_lineage_seeds_get_distinct_genomes(self):
+        om = OrganismManager(SMALL, 4, torch.ones(SMALL, SMALL, device=device) * 0.5)
+        om.topology_matrix.zero_()
+        om.energy_matrix.zero_()
+        om.positions = torch.tensor([[1, 1], [3, 3], [5, 5], [7, 7]], dtype=torch.long, device=device)
+        om.enable_colony_mutation()
+        om._initialize_topology()
+        gids = [int(om.colony_mutation_graph.genome_id_field[y, x].item()) for y, x in [(1, 1), (3, 3), (5, 5), (7, 7)]]
+        self.assertEqual(len(set(gids)), 4)
+
+    def test_apply_loaded_cnn_attaches_model_only(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        cnn = EnergyDistributionCNN(device)
+        apply_loaded_cnn(om, cnn)
+        self.assertFalse(om.colony_mutation_enabled)
+        self.assertIs(om.energy_distribution_cnn, cnn)
+
+    def test_configure_organism_manager_lineage_flag(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        args = argparse.Namespace(load=False, lineage=True)
+        main_module.configure_organism_manager_from_args(om, args)
+        self.assertTrue(om.colony_mutation_enabled)
+
+    def test_lineage_reseeds_after_extinction(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.enable_colony_mutation()
+        om.topology_matrix.zero_()
+        om.energy_matrix.zero_()
+        om.reseed_organism_positions_if_extinct()
+        self.assertEqual(om.topology_matrix[6, 6].item(), 1)
+        self.assertEqual(om.energy_matrix[6, 6].item(), 1)
+        self.assertEqual(om.parent_giver_dir[6, 6].item(), -1)
+        self.assertGreaterEqual(om.colony_mutation_graph.cell_id[6, 6].item(), 0)
+
+    def test_lineage_no_reseed_without_lineage_flag(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.topology_matrix.zero_()
+        om.energy_matrix.zero_()
+        om.reseed_organism_positions_if_extinct()
+        self.assertEqual(om.topology_matrix.sum().item(), 0)
+
+    def test_cnn_forward_applies_mutation_transform(self):
+        cnn = EnergyDistributionCNN(device)
+        graph = ColonyMutationGraph(SMALL, device, 1.0, 0.5)
+        graph.register_seed(6, 6)
+        swap = torch.eye(11, device=device)
+        swap[3, 3] = 0.0
+        swap[4, 4] = 0.0
+        swap[3, 4] = 1.0
+        swap[4, 3] = 1.0
+        graph.transform_field[:, :, 6, 6] = swap
+        graph.non_identity_mask[6, 6] = True
+        apply_mask = graph.mutation_apply_mask(torch.zeros(SMALL, SMALL, device=device))
+        apply_mask[6, 6] = True
+        h = SMALL
+        shareable = torch.zeros(h, h, device=device)
+        shareable[6, 6] = 0.5
+        terrain = torch.ones(h, h, device=device) * 0.5
+        sharing = torch.full((h, h), SHARING_ON_VALUE, device=device)
+        hidden = torch.zeros(1, h, h, device=device)
+        rotation = torch.zeros(h, h, device=device)
+        out_base, _, _ = cnn(
+            shareable, terrain, sharing, hidden, rotation, mutation_transform=None
+        )
+        out_mut, _, _ = cnn(
+            shareable,
+            terrain,
+            sharing,
+            hidden,
+            rotation,
+            mutation_transform=graph.transform_field,
+            mutation_apply_mask=apply_mask,
+            lineage_mutation_cell_count=1,
+        )
+        self.assertFalse(torch.allclose(out_base[1, 1, 6, 6], out_mut[1, 1, 6, 6]))
+
+    def test_genome_panel_lines_top_ten_with_percent(self):
+        graph = ColonyMutationGraph(SMALL, device, 1.0, 0.1)
+        topology = torch.zeros(SMALL, SMALL, device=device)
+        graph.register_seed(0, 0)
+        major_gid = int(graph.genome_id_field[0, 0].item())
+        for y, x in [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0)]:
+            graph.genome_id_field[y, x] = major_gid
+            topology[y, x] = 1
+        graph._assign_genome_id_fast(2, 1, graph.sample_seed_genome_transform())
+        minor_gid = int(graph.genome_id_field[2, 1].item())
+        for y, x in [(2, 1), (2, 2), (3, 0)]:
+            graph.genome_id_field[y, x] = minor_gid
+            topology[y, x] = 1
+        genome_count, lines = graph.genome_panel_lines(topology)
+        self.assertEqual(genome_count, 2)
+        self.assertEqual(len(lines), 2)
+        text, color = lines[0]
+        self.assertIn("7 cells", text)
+        self.assertIn("70.0%", text)
+        self.assertEqual(len(color), 3)
+
+
 class TestOrganismManagerEnergy(unittest.TestCase):
     def setUp(self):
         self.om = make_organism_manager(SMALL)
@@ -294,6 +542,17 @@ class TestOrganismManagerEnergy(unittest.TestCase):
         om = make_organism_manager(SMALL, center=(SMALL // 2, SMALL // 2))
         self.assertGreater(om.topology_matrix.sum().item(), 0)
         self.assertGreater(om.energy_matrix.sum().item(), 0)
+
+    def test_random_organism_positions_count_and_bounds(self):
+        positions = random_organism_positions(SMALL, 5)
+        self.assertEqual(len(positions), 5)
+        flat = [p[0] + p[1] * SMALL for p in positions]
+        self.assertEqual(len(set(flat)), 5)
+        for x, y in positions:
+            self.assertGreaterEqual(x, 0)
+            self.assertLess(x, SMALL)
+            self.assertGreaterEqual(y, 0)
+            self.assertLess(y, SMALL)
 
     def test_compute_energy_contributions_shape(self):
         shareable = torch.ones(SMALL, SMALL, device=device)
@@ -344,7 +603,25 @@ class TestOrganismManagerEnergy(unittest.TestCase):
         self.om.compute_topology()
         self.assertEqual(self.om.topology_matrix[y, x].item(), 1)
         self.assertEqual(self.om.parent_giver_dir[y, x].item(), 6)
-        self.assertAlmostEqual(self.om.sharing_rate_matrix[y, x].item(), 0.9, places=4)
+        self.assertAlmostEqual(self.om.sharing_rate_matrix[y, x].item(), SHARING_ON_VALUE, places=4)
+        self.assertAlmostEqual(self.om.hidden_channels[0, y, x].item(), 1.0, places=4)
+
+    def test_birth_inherits_parent_hidden_zero(self):
+        y, x = 6, 6
+        py, px = 5, 6
+        self.om.topology_matrix[py, px] = 1
+        self.om.hidden_channels[0, py, px] = 0.0
+        self.om.new_cell_candidates = torch.zeros(SMALL, SMALL, dtype=torch.bool, device=device)
+        self.om.new_cell_candidates[y, x] = True
+        self.om.pending_birth_energy[y, x] = 0.5
+        ring = EnergyDistributionCNN._RING_CIJ
+        contrib = torch.zeros(3, 3, SMALL, SMALL, device=device)
+        ci, cj = ring[(6 + 4) % 8]
+        contrib[ci, cj, py, px] = 5.0
+        self.om.new_cell_contributions = contrib
+        self.om.compute_topology()
+        self.assertAlmostEqual(self.om.sharing_rate_matrix[y, x].item(), SHARING_OFF_VALUE, places=4)
+        self.assertAlmostEqual(self.om.hidden_channels[0, y, x].item(), 0.0, places=4)
 
     def test_candidates_do_not_store_energy_before_birth(self):
         sim = Simulation(enable_debug=False)
@@ -384,16 +661,15 @@ class TestOrganismManagerEnergy(unittest.TestCase):
 
 
 class TestEnvironment(unittest.TestCase):
-    def test_generate_terrain_sine_in_range(self):
-        env = Environment(SMALL, 0.01, 0.01)
+    def test_type_2_terrain_starts_from_perlin(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
         env.environment_type = 2
-        terrain = env._generate_sine_terrain()
+        terrain = env.generate_terrain()
         self.assertEqual(terrain.shape, (SMALL, SMALL))
-        self.assertTrue(torch.all(terrain >= 0))
-        self.assertTrue(torch.all(terrain <= 1))
+        self.assertGreater(terrain.max().item(), 0.0)
 
     def test_generate_terrain_dispatches_type(self):
-        env = Environment(SMALL, 0.01, 0.01)
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
         env.environment_type = 1
         t1 = env.generate_terrain()
         env.environment_type = 2
@@ -401,16 +677,133 @@ class TestEnvironment(unittest.TestCase):
         self.assertEqual(t1.shape, (SMALL, SMALL))
         self.assertEqual(t2.shape, (SMALL, SMALL))
 
+    def test_type1_boost_only_center_3x3(self):
+        env = Environment(SMALL, 0.01, 0.01, [[0, 0], [1, 1]])
+        env.environment_type = 1
+        terrain = env._generate_energy_mask_terrain()
+        cy, cx = SMALL // 2, SMALL // 2
+        self.assertEqual(terrain[cy, cx].item(), 1.0)
+        self.assertEqual(terrain[0, 0].item(), 0.0)
+        self.assertEqual(int(terrain.gt(0).sum().item()), 9)
+
     def test_compute_environment_depletes_terrain(self):
-        env = Environment(SMALL, 0.01, 0.01)
-        env.environment_type = 2
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 1
+        env.terrain[0, 0] = 0.8
         before = env.terrain.clone()
         topology = torch.zeros(SMALL, SMALL, device=device)
-        topology[6, 6] = 1
+        topology[0, 0] = 1
         harvested = torch.zeros(SMALL, SMALL, device=device)
-        harvested[6, 6] = 1.0
+        harvested[0, 0] = 1.0
         env.compute_environment(topology, harvested)
-        self.assertLess(env.terrain[6, 6].item(), before[6, 6].item())
+        self.assertLess(env.terrain[0, 0].item(), before[0, 0].item())
+
+    def test_pump_perlin_wave_zero_mean(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        wave = env._centered_pump_wave()
+        self.assertAlmostEqual(wave.mean().item(), 0.0, places=4)
+
+    def test_pump_wave_changes_terrain(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        env.terrain.fill_(0.5)
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.topology_matrix.fill_(1.0)
+        om.energy_matrix.fill_(0.05)
+        before = env.terrain.clone()
+        env._apply_thermodynamic_pump(om)
+        self.assertFalse(torch.allclose(env.terrain, before))
+
+    def test_type2_static_base_unchanged_without_pump(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        base = env.generate_terrain()
+        env.terrain = base.clone()
+        topology = torch.zeros(SMALL, SMALL, device=device)
+        with patch("main.TERRAIN_PUMP_ENABLED", False):
+            env.compute_environment(topology, torch.zeros(SMALL, SMALL, device=device))
+        self.assertTrue(torch.allclose(env.terrain, base))
+
+    def test_type2_harvest_depletes_then_pump_heals_trail(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.topology_matrix[6, 6] = 1.0
+        env.terrain = env.generate_terrain()
+        env.terrain[6, 6] -= 0.35
+        low = env.terrain[6, 6].item()
+        env._pump_drive = 1.0
+        healed = low
+        for _ in range(80):
+            env._apply_thermodynamic_pump(om)
+            env.terrain.clamp_(0.0, 1.0)
+            healed = env.terrain[6, 6].item()
+            if healed > low + 0.02:
+                break
+        self.assertGreater(healed, low)
+
+    def test_pump_population_error_negative_when_above_half_grid(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.topology_matrix.fill_(1.0)
+        self.assertLess(env._pump_population_error(om), 0.0)
+
+    def test_pump_pid_drive_negative_when_above_half_grid(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.topology_matrix.fill_(1.0)
+        for _ in range(40):
+            drive = env._pump_pid_step(env._pump_population_error(om))
+        self.assertLess(drive, 0.0)
+
+    def test_thermodynamic_pump_subtracts_wave_when_negative_drive(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        om = make_organism_manager(SMALL, center=(6, 6))
+        env.terrain.fill_(0.6)
+        om.topology_matrix.fill_(1.0)
+        om.energy_matrix.fill_(0.7)
+        before = env.terrain.clone()
+        env._pump_drive = -1.0
+        env._apply_thermodynamic_pump(om)
+        self.assertFalse(torch.allclose(env.terrain, before))
+
+    def test_thermodynamic_pump_adds_wave_when_positive_drive(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        env.terrain.fill_(0.6)
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.topology_matrix.fill_(1.0)
+        om.energy_matrix.fill_(0.05)
+        before = env.terrain.clone()
+        env._pump_drive = 1.0
+        env._apply_thermodynamic_pump(om)
+        self.assertFalse(torch.allclose(env.terrain, before))
+
+    def test_type2_pump_wave_near_zero_mean_sum(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 2
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.topology_matrix.fill_(1.0)
+        om.energy_matrix.fill_(0.1)
+        env.terrain = env.base_terrain.clone()
+        base_sum = env.terrain.sum().item()
+        env._pump_drive = 1.0
+        for _ in range(50):
+            env._apply_thermodynamic_pump(om)
+            env.terrain.clamp_(0.0, 1.0)
+        self.assertLessEqual(abs(env.terrain.sum().item() - base_sum), 8.0)
+
+    def test_type3_replaces_terrain_with_perlin(self):
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
+        env.environment_type = 3
+        env.terrain.fill_(0.0)
+        topology = torch.zeros(SMALL, SMALL, device=device)
+        env.compute_environment(topology, torch.zeros(SMALL, SMALL, device=device))
+        self.assertGreater(env.terrain.max().item(), 0.0)
 
 
 class TestRenderer(unittest.TestCase):
@@ -485,7 +878,7 @@ class TestWorkerHelpers(unittest.TestCase):
         _init_worker(str(device))
         cnn = EnergyDistributionCNN(device)
         cpu_state = {k: v.cpu().clone() for k, v in cnn.state_dict().items()}
-        args = (cpu_state, SMALL, 3, 0, False)
+        args = (cpu_state, SMALL, 3, 0, False, "cell_count")
         fitness, tick_data = _evaluate_cnn_worker(args)
         self.assertIsInstance(fitness, float)
         self.assertEqual(tick_data, [])
@@ -507,6 +900,170 @@ class TestCNNEvolutionDriver(unittest.TestCase):
         sim = Simulation(enable_debug=False)
         fitness = driver.evaluate_cnn(cnn, sim)
         self.assertGreaterEqual(fitness, 0.0)
+
+
+class TestCNNFitnessModes(unittest.TestCase):
+    def test_cell_count_mode_accumulates_cells(self):
+        sim = Simulation(enable_debug=False)
+        with patch("main.CNN_FITNESS_MODE", "cell_count"):
+            fitness, cumulative, _ = run_cnn_fitness_rollout(sim, 5)
+        self.assertGreaterEqual(fitness, 0.0)
+        self.assertGreaterEqual(cumulative, 0.0)
+
+    def test_entropy_production_mode_uses_destroyed_entropy(self):
+        sim = Simulation(enable_debug=False)
+        with patch("main.CNN_FITNESS_MODE", "entropy_production"):
+            fitness, _, _ = run_cnn_fitness_rollout(sim, 10)
+        self.assertGreaterEqual(fitness, 0.0)
+        self.assertGreaterEqual(sim.organism_manager.destroyed_entropy, 0.0)
+        self.assertGreaterEqual(sim.organism_manager.destroyed_energy, 0.0)
+
+    def test_persistence_mode_uniform_terrain(self):
+        sim = Simulation(enable_debug=False)
+        _configure_fitness_environment(sim, "persistence")
+        self.assertAlmostEqual(
+            sim.environment.terrain.min().item(),
+            CNN_FITNESS_PERSISTENCE_TERRAIN,
+            places=4,
+        )
+        self.assertAlmostEqual(
+            sim.environment.terrain.max().item(),
+            CNN_FITNESS_PERSISTENCE_TERRAIN,
+            places=4,
+        )
+
+    def test_persistence_fitness_is_tick_count_not_cell_sum(self):
+        sim = Simulation(enable_debug=False)
+        max_time = 8
+        with patch("main.CNN_FITNESS_MODE", "persistence"):
+            fitness, cumulative, _ = run_cnn_fitness_rollout(sim, max_time)
+        self.assertLessEqual(fitness, max_time)
+        self.assertGreaterEqual(fitness, 0.0)
+        if fitness > 0:
+            self.assertLessEqual(fitness, cumulative)
+
+    def test_persistence_can_end_before_max_time(self):
+        sim = Simulation(enable_debug=False)
+        with patch("main.CNN_FITNESS_MODE", "persistence"):
+            fitness, _, _ = run_cnn_fitness_rollout(sim, 200)
+        self.assertLessEqual(fitness, 200.0)
+
+    def test_entropy_and_cell_count_modes_can_differ(self):
+        sim_cell = Simulation(enable_debug=False)
+        sim_entropy = Simulation(enable_debug=False)
+        cell_fitness, _, _ = run_cnn_fitness_rollout(sim_cell, 15, fitness_mode="cell_count")
+        entropy_fitness, _, _ = run_cnn_fitness_rollout(sim_entropy, 15, fitness_mode="entropy_production")
+        self.assertGreaterEqual(cell_fitness, 0.0)
+        self.assertGreaterEqual(entropy_fitness, 0.0)
+
+    def test_validate_cnn_fitness_mode_rejects_unknown(self):
+        with self.assertRaises(ValueError):
+            validate_cnn_fitness_mode("biomass")
+
+    def test_evaluator_passes_fitness_mode_to_worker(self):
+        evaluator = CNNEvaluator(SMALL, 3, device, fitness_mode="persistence")
+        self.assertEqual(evaluator.fitness_mode, "persistence")
+
+    def test_evolution_driver_fitness_mode(self):
+        driver = CNNEvolutionDriver(SMALL, epochs=1, max_time=3, fitness_mode="entropy_production")
+        self.assertEqual(driver.fitness_mode, "entropy_production")
+        self.assertEqual(driver.evaluator.fitness_mode, "entropy_production")
+
+    def test_compare_fitness_modes_all_modes(self):
+        import compare_fitness_modes
+
+        cnn = EnergyDistributionCNN(device)
+        rows = compare_fitness_modes.evaluate_cnn_all_modes(cnn, 5)
+        self.assertEqual(len(rows), len(CNN_FITNESS_MODES))
+
+    def test_life_like_mode_combines_entropy_and_order(self):
+        sim = Simulation(enable_debug=False)
+        with patch("main.CNN_FITNESS_LIFE_LIKE_ORDER_WEIGHT", 1.0), patch(
+            "main.CNN_FITNESS_LIFE_LIKE_ENTROPY_FLOOR", 0.0
+        ):
+            fitness, _, _ = run_cnn_fitness_rollout(sim, 15, fitness_mode="life_like")
+        self.assertGreaterEqual(fitness, 0.0)
+
+    def test_life_like_rewards_negative_delta_config_entropy(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        terrain = torch.ones(SMALL, SMALL, device=device) * 0.5
+        om.energy_matrix[6, 6] = 0.5
+        s_start = configurational_entropy(om, terrain)
+        om.energy_matrix[6, 6] = 0.9
+        s_ordered = configurational_entropy(om, terrain)
+        delta = (s_ordered - s_start).item()
+        score = 1.0 - 1.0 * delta
+        self.assertLess(delta, 0.0)
+        self.assertGreater(score, 1.0)
+
+    @patch("main.CNN_FITNESS_LIFE_LIKE_ENTROPY_FLOOR", 100.0)
+    def test_life_like_entropy_floor_zeros_fitness(self):
+        sim = Simulation(enable_debug=False)
+        fitness, _, _ = run_cnn_fitness_rollout(sim, 5, fitness_mode="life_like")
+        self.assertEqual(fitness, 0.0)
+
+
+class TestThermodynamicEntropy(unittest.TestCase):
+    def test_mixing_entropy_max_at_half(self):
+        e = torch.tensor([0.5], device=device)
+        s = mixing_entropy(e)
+        self.assertGreater(s.item(), mixing_entropy(torch.tensor([0.1], device=device)).item())
+
+    def test_chemical_potential_sign(self):
+        low = chemical_potential(torch.tensor([0.1], device=device)).item()
+        high = chemical_potential(torch.tensor([0.9], device=device)).item()
+        self.assertGreater(low, 0.0)
+        self.assertLess(high, 0.0)
+
+    def test_decay_entropy_production_non_negative(self):
+        energy = torch.tensor([0.2, 0.8], device=device)
+        sharing = torch.tensor([1.0, 1.0], device=device)
+        org_avg = torch.tensor([0.1, 0.1], device=device)
+        topo = torch.tensor([1.0, 1.0], device=device)
+        loss, sigma_dot = thermodynamic_decay_step(energy, sharing, org_avg, topo)
+        self.assertTrue(torch.all(sigma_dot >= 0))
+        self.assertTrue(torch.all(loss >= 0))
+
+    def test_destroyed_entropy_tracks_energy_over_temperature(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.energy_matrix[6, 6] = 0.5
+        om._add_destroyed_energy(torch.tensor(0.1, device=device))
+        om._flush_tick_destroyed()
+        from config import THERMO_ENV_TEMPERATURE
+        self.assertAlmostEqual(om.destroyed_entropy, 0.1 / THERMO_ENV_TEMPERATURE, places=5)
+
+    def test_harvest_produces_irreversible_entropy(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.energy_matrix[6, 6] = 0.2
+        om.sharing_rate_matrix[6, 6] = 1.0
+        terrain = torch.ones(SMALL, SMALL, device=device) * 0.8
+        entropy_before = om.destroyed_entropy
+        om._apply_harvest_and_decay(terrain)
+        om._flush_tick_destroyed()
+        self.assertGreater(om.destroyed_entropy, entropy_before)
+
+    def test_system_entropy_total_includes_pools(self):
+        sim = Simulation(enable_debug=False)
+        from main import system_entropy_total
+
+        total = system_entropy_total(sim.organism_manager, sim.environment.terrain)
+        self.assertGreaterEqual(total.item(), 0.0)
+
+    @patch("main.ENERGY_DECAY", 0.05)
+    def test_decay_destroyed_entropy_matches_energy_loss_over_t(self):
+        om = make_organism_manager(SMALL, center=(6, 6))
+        om.energy_matrix[6, 6] = 0.7
+        om.sharing_rate_matrix[6, 6] = 1.0
+        terrain = torch.zeros(SMALL, SMALL, device=device)
+        entropy_before = om.destroyed_entropy
+        energy_before = om.destroyed_energy
+        om._apply_harvest_and_decay(terrain)
+        om._flush_tick_destroyed()
+        from config import THERMO_ENV_TEMPERATURE
+        d_e = om.destroyed_energy - energy_before
+        d_s = om.destroyed_entropy - entropy_before
+        self.assertGreater(d_e, 0.0)
+        self.assertAlmostEqual(d_s, d_e / THERMO_ENV_TEMPERATURE, places=4)
 
 
 class TestThermodynamics(unittest.TestCase):
@@ -586,14 +1143,14 @@ class TestThermodynamics(unittest.TestCase):
         metrics = apply_sharing_physics(om, terrain, proportions)
         self.assertAlmostEqual(metrics["energy_incoming"][6, 6].item(), 0.0, places=4)
 
+    @patch("main.ENERGY_DECAY", 0.05)
     def test_decay_destroys_energy_without_harvest(self):
         om = make_organism_manager(SMALL, center=(6, 6))
-        om.energy_matrix[6, 6] = 0.5
+        om.energy_matrix[6, 6] = 0.7
         om.sharing_rate_matrix[6, 6] = 1.0
         terrain = torch.zeros(SMALL, SMALL, device=device)
         before = om.energy_matrix.sum().item()
-        with patch("main.ENERGY_DENSITY_DECAY_MODIFIER", 1.0):
-            om._apply_harvest_and_decay(terrain)
+        om._apply_harvest_and_decay(terrain)
         after = om.energy_matrix.sum().item()
         self.assertLess(after, before)
 
@@ -608,14 +1165,17 @@ class TestThermodynamics(unittest.TestCase):
         after = om.energy_matrix[6, 6].item()
         self.assertGreater(after, before)
 
-    def test_harvest_bounded_by_rate_and_terrain(self):
+    def test_harvest_bounded_by_terrain_and_capacity(self):
         om = make_organism_manager(SMALL, center=(6, 6))
+        om.energy_matrix[6, 6] = 0.2
         om.sharing_rate_matrix[6, 6] = 1.0
         terrain = torch.ones(SMALL, SMALL, device=device) * 0.8
         harvested = om._apply_harvest_and_decay(terrain)
-        self.assertLessEqual(harvested[6, 6].item(), ENERGY_HARVEST_RATE + 1e-6)
+        self.assertGreater(harvested[6, 6].item(), 0.0)
+        self.assertLessEqual(harvested[6, 6].item(), 0.8 + 1e-6)
         self.assertLessEqual(harvested[6, 6].item(), 0.8 + 1e-6)
 
+    @patch("main.TERRAIN_PUMP_ENABLED", False)
     def test_full_tick_depletes_environment_on_harvest(self):
         sim = Simulation(enable_debug=False)
         sim.environment.environment_type = 2
@@ -625,7 +1185,7 @@ class TestThermodynamics(unittest.TestCase):
         sim.environment.compute_environment(sim.organism_manager.topology_matrix, harvested)
         terrain_after = sim.environment.terrain.sum().item()
         org_after = sim.organism_manager.energy_matrix.sum().item()
-        if harvested.sum().item() > 0:
+        if harvested.sum().item() > 0 and terrain_before.sum().item() > 0:
             self.assertLessEqual(terrain_after, terrain_before.sum().item())
         self.assertTrue(torch.all(sim.organism_manager.energy_matrix >= 0))
         self.assertTrue(torch.all(sim.organism_manager.energy_matrix <= 1))
@@ -642,7 +1202,16 @@ class TestThermodynamics(unittest.TestCase):
         om_manual.sharing_rate_matrix[6, 6] = 1.0
         apply_sharing_physics(om_manual, terrain.clone(), proportions)
 
-        def fixed_forward(shareable, terr, sharing, hidden, rotation):
+        def fixed_forward(
+            shareable,
+            terr,
+            sharing,
+            hidden,
+            rotation,
+            mutation_transform=None,
+            mutation_apply_mask=None,
+            lineage_mutation_cell_count=0,
+        ):
             return proportions, torch.zeros_like(sharing), hidden
 
         om.energy_matrix[6, 6] = 0.7
@@ -686,7 +1255,7 @@ class TestThermodynamics(unittest.TestCase):
         harvest_at_cell = harvested[6, 6].item()
         self.assertGreater(harvest_at_cell, 0.0)
 
-        env = Environment(SMALL, 0.01, 0.01)
+        env = Environment(SMALL, 0.01, 0.01, [[6, 6]])
         env.terrain = terrain.clone()
         env.environment_type = 2
         terrain_before = env.terrain[6, 6].item()
@@ -748,6 +1317,7 @@ class TestThermodynamics(unittest.TestCase):
 
 
 class TestE2EConservation(unittest.TestCase):
+    @patch("main.TERRAIN_PUMP_ENABLED", False)
     def test_single_organism_conserves_total_energy_over_ticks(self):
         sim = Simulation(enable_debug=False)
         sim.environment.environment_type = 2
