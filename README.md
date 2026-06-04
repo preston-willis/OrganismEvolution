@@ -97,12 +97,6 @@ This runs the genetic algorithm to evolve CNN populations. Training progress is 
 
 `life_like` uses normal terrain (not persistence’s uniform field). Tune `CNN_FITNESS_LIFE_LIKE_ORDER_WEIGHT` (λ) and optional `CNN_FITNESS_LIFE_LIKE_ENTROPY_FLOOR` (minimum ∫σ̇ or fitness is zero).
 
-Compare one CNN under all modes:
-
-```bash
-python compare_fitness_modes.py --load --ticks 200
-```
-
 ### Loading Trained Models
 
 ```bash
@@ -145,14 +139,17 @@ python main.py --help
 ## Project Structure
 
 ```
-OrganismEvolution/ 
-├── main.py        # Main entry point with CLI
-├── config.py      # Configuration parameters
-├── gpu_handler.py # GPU device management
-├── Grapher.py     # Evolution progress visualization
-├── input_handler.py # Keyboard input handling
-├── logger.py      # Performance logging
-└── data/          # Saved CNN models
+OrganismEvolution/
+├── main.py          # CLI and OpenGL wiring
+├── simulation.py    # Tick loop
+├── organism.py      # Grid state and tick orchestration
+├── physics.py       # Band-resolved Onsager thermodynamics
+├── environment.py   # Terrain and pump
+├── evolution.py     # Genetic algorithm and training
+├── cnn.py           # CPPN and energy-distribution CNN
+├── config.py        # Parameters
+├── renderer.py      # OpenGL visualization
+└── data/            # Saved CNN checkpoints
 ```
 
 ## Requirements
